@@ -1,0 +1,10 @@
+<launch>
+  <!-- Lane follower in simulation.
+       Use test_lane_publisher to feed synthetic /left_lane_line / /right_lane_line
+       without a real camera, or run lane_detector for camera-based detection. -->
+
+  <node pkg="final_challenge" exec="boundary_pure_pursuit" output="screen">
+    <param name="drive_topic" value="/drive"/>
+    <param name="track_side"  value="left"/>
+  </node>
+</launch>
