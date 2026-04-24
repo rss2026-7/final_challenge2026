@@ -11,41 +11,28 @@ from sensor_msgs.msg import Image
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
 
-from visual_servoing.computer_vision.white_line_detection import (
+from final_challenge.computer_vision.white_line_detection import (
     detect_lane_lines_hough,
     ROI_TOP_FRAC,
 )
 
-# ── Homography calibration ────────────────────────────────────────────────────
-# Map image pixels (u, v) → car-frame ground plane (x, y) in metres.
-# Convention: +x = forward (direction the car faces), +y = left of the car.
-#
-# TODO: fill these in before running on the real robot.
-# How to calibrate:
-#   1. Place a marker at a known position (x_m, y_m) metres from the car.
-#   2. Find its pixel location (u, v) in a live ZED frame.
-#   3. Add both to the lists below.
-#   Spread points across the full lane-visible range: 0.5–3 m ahead,
-#   left and right of centre.  At least 4 points required.
-#
-# Example (replace with real measurements):
+# ── Homography calibration (from visual_servoing/homography_transformer.py) ──
+# [u, v] pixel coordinates — origin top-left, u right, v down.
 PTS_IMAGE_PLANE = [
-    # [u, v],   # description
-    [320, 400],  # placeholder — 1.0 m ahead, centre
-    [200, 400],  # placeholder — 1.0 m ahead, left
-    [440, 400],  # placeholder — 1.0 m ahead, right
-    [320, 300],  # placeholder — 2.0 m ahead, centre
+    [211, 162],
+    [415, 154],
+    [351, 145],
+    [402, 167],
 ]
+# [x, y] in metres relative to car: +x forward, +y left.
+# Source values are in cm; converted here by × 0.01.
 PTS_GROUND_PLANE = [
-    # [x_m,  y_m],   # description
-    [1.00,  0.00],   # placeholder — 1.0 m ahead, centre
-    [1.00,  0.30],   # placeholder — 1.0 m ahead, left
-    [1.00, -0.30],   # placeholder — 1.0 m ahead, right
-    [2.00,  0.00],   # placeholder — 2.0 m ahead, centre
+    [30.48  * 0.01,   7.62 * 0.01],
+    [46.99  * 0.01, -12.70 * 0.01],
+    [109.22 * 0.01, -13.97 * 0.01],
+    [22.86  * 0.01,  -6.35 * 0.01],
 ]
 # ─────────────────────────────────────────────────────────────────────────────
-
-METERS_PER_UNIT = 1.0  # PTS_GROUND_PLANE already in metres
 
 # Tunable
 N_SAMPLES = 15   # points sampled per detected lane line
