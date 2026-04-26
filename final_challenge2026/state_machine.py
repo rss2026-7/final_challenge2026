@@ -67,7 +67,7 @@ class FinalChallengeStateMachine(Node):
         # ------------------------------------------------------------------ #
         #  Parameters                                                          #
         # ------------------------------------------------------------------ #
-        self.declare_parameter("odom_topic",             "/vesc/odom")
+        self.declare_parameter("odom_topic",             "/pf/pose/odom")
         self.declare_parameter("drive_topic",            "/vesc/ackermann_cmd")
         self.declare_parameter("arrival_threshold",      0.5)   # metres
         self.declare_parameter("park_duration",          5.0)   # seconds
