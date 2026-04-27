@@ -32,6 +32,9 @@ setup(
         'console_scripts': [
             'lane_follower = final_challenge.lane_follower:main',
             'test_lane_publisher = final_challenge.test_lane_publisher:main',
+            'state_machine = final_challenge2026.state_machine:main',
+            'basement_point_publisher = final_challenge2026.basement_point_publisher:main',
+
         ],
     },
 )
