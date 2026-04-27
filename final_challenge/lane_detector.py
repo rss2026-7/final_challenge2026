@@ -11,45 +11,16 @@ from sensor_msgs.msg import Image
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
 
-from final_challenge.computer_vision.white_line_detection import (
+from final_challenge.white_line_detection import (
     detect_lane_lines_hough,
+    detect_white_lines,
     ROI_TOP_FRAC,
 )
-
-# ── Homography calibration (from visual_servoing/homography_transformer.py) ──
-# [u, v] pixel coordinates — origin top-left, u right, v down.
-PTS_IMAGE_PLANE = [
-    [211, 162],
-    [415, 154],
-    [351, 145],
-    [402, 167],
-]
-# [x, y] in metres relative to car: +x forward, +y left.
-# Source values are in cm; converted here by × 0.01.
-PTS_GROUND_PLANE = [
-    [30.48  * 0.01,   7.62 * 0.01],
-    [46.99  * 0.01, -12.70 * 0.01],
-    [109.22 * 0.01, -13.97 * 0.01],
-    [22.86  * 0.01,  -6.35 * 0.01],
-]
-# ─────────────────────────────────────────────────────────────────────────────
+from final_challenge.homography_transformer import build_homography, transform_uv_to_xy
 
 # Tunable
-N_SAMPLES = 15   # points sampled per detected lane line
-MIN_VOTES = 3    # discard clusters with fewer accumulator votes
-
-
-def _build_homography():
-    np_img    = np.float32(PTS_IMAGE_PLANE)[:, np.newaxis, :]
-    np_ground = np.float32(PTS_GROUND_PLANE)[:, np.newaxis, :]
-    H, _ = cv2.findHomography(np_img, np_ground)
-    return H
-
-
-def _px_to_car(u, v, H):
-    """Transform a single image pixel to car-frame (x_fwd, y_left) in metres."""
-    p = H @ np.array([u, v, 1.0])
-    return float(p[0] / p[2]), float(p[1] / p[2])
+N_SAMPLES = 15   # points sampled per detected Hough line
+MIN_VOTES = 3    # discard Hough clusters with fewer accumulator votes
 
 
 def _make_path(points, stamp, frame_id="base_link"):
@@ -71,8 +42,17 @@ def _make_path(points, stamp, frame_id="base_link"):
 
 class LaneDetector(Node):
     """
-    Detects left and right lane boundaries with Hough transforms and publishes
-    them as nav_msgs/Path messages consumed by BoundaryPurePursuit.
+    Detects left and right lane boundaries and publishes them as
+    nav_msgs/Path in base_link frame for BoundaryPurePursuit.
+
+    Detection strategy
+    ------------------
+    Primary: detect_lane_lines_hough() — stable on straight sections.
+    Fallback: detect_white_lines() blob detector — handles curves where
+    Hough produces fewer than 2 valid lines.
+
+    Left/right classification is done in the car frame (after homography),
+    not by image-space slope sign, so it remains correct on curves.
 
     Subscriptions
     -------------
@@ -88,7 +68,7 @@ class LaneDetector(Node):
     def __init__(self):
         super().__init__("lane_detector")
 
-        self.H = _build_homography()
+        self.H = build_homography()
         self.bridge = CvBridge()
 
         self.left_pub  = self.create_publisher(Path,  "/left_lane_line",  10)
@@ -104,72 +84,159 @@ class LaneDetector(Node):
 
         self.get_logger().info("LaneDetector initialised.")
 
+    # ------------------------------------------------------------------
+    # Main callback
+    # ------------------------------------------------------------------
     def image_callback(self, msg: Image):
         frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         h, w  = frame.shape[:2]
         roi_top = int(ROI_TOP_FRAC * h)
         stamp = msg.header.stamp
 
-        lane_lines = detect_lane_lines_hough(frame)
-
-        # Separate detections by sign of slope; keep best (highest votes) per side.
-        best_left  = None
-        best_right = None
-        for ll in lane_lines:
-            if ll['votes'] < MIN_VOTES:
-                continue
-            m, _ = ll['coeffs']
-            if m < 0:
-                if best_left is None or ll['votes'] > best_left['votes']:
-                    best_left = ll
-            else:
-                if best_right is None or ll['votes'] > best_right['votes']:
-                    best_right = ll
-
-        left_pts  = self._line_to_car_pts(best_left,  h, w, roi_top)
-        right_pts = self._line_to_car_pts(best_right, h, w, roi_top)
+        left_pts, right_pts, debug_lines = self._detect_boundaries(frame, h, w, roi_top)
 
         self.left_pub.publish(_make_path(left_pts,  stamp))
         self.right_pub.publish(_make_path(right_pts, stamp))
+        self._publish_debug(frame, debug_lines, roi_top)
 
-        self._publish_debug(frame, best_left, best_right, left_pts, right_pts, roi_top)
+    # ------------------------------------------------------------------
+    # Boundary detection — Hough primary, blob fallback
+    # ------------------------------------------------------------------
+    def _detect_boundaries(self, frame, h, w, roi_top):
+        """
+        Return (left_pts, right_pts, debug_lines).
 
-    def _line_to_car_pts(self, ll, h, w, roi_top):
-        """Sample a detected line into car-frame (x, y) points, near-to-far."""
-        if ll is None:
-            return []
+        left_pts / right_pts : list of (x_car, y_car) sorted near-to-far.
+        debug_lines          : list of Hough line dicts for the debug image
+                               (may be empty when using blob fallback).
+        """
+        # ── Primary: Hough detector ───────────────────────────────────
+        hough_lines = detect_lane_lines_hough(frame)
 
+        # Convert every sufficiently-voted Hough line to car-frame points
+        # and record its median lateral position.
+        car_lines = []
+        for ll in hough_lines:
+            if ll['votes'] < MIN_VOTES:
+                continue
+            pts = self._hough_line_to_car_pts(ll, h, w, roi_top)
+            if len(pts) >= 2:
+                median_y = float(np.median([p[1] for p in pts]))
+                car_lines.append((median_y, ll, pts))
+
+        if len(car_lines) >= 2:
+            left_pts, right_pts = self._split_left_right(car_lines)
+            debug_lines = [ll for _, ll, _ in car_lines]
+            return left_pts, right_pts, debug_lines
+
+        # ── Fallback: blob detector (better on curves) ────────────────
+        self.get_logger().warn(
+            "Hough produced <2 valid lines — falling back to blob detector.",
+            throttle_duration_sec=1.0,
+        )
+        blob_spines = detect_white_lines(frame)
+
+        car_lines = []
+        for spine in blob_spines:
+            pts = self._spine_to_car_pts(spine)
+            if len(pts) >= 2:
+                median_y = float(np.median([p[1] for p in pts]))
+                car_lines.append((median_y, None, pts))
+
+        if len(car_lines) >= 2:
+            left_pts, right_pts = self._split_left_right(car_lines)
+            return left_pts, right_pts, []
+
+        # Only one or zero lines — return whatever we have
+        all_pts = [pts for _, _, pts in car_lines]
+        left_pts  = all_pts[0] if len(all_pts) > 0 else []
+        right_pts = all_pts[1] if len(all_pts) > 1 else []
+        return left_pts, right_pts, []
+
+    # ------------------------------------------------------------------
+    # Left / right classification in car frame
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _split_left_right(car_lines):
+        """
+        Given a list of (median_y, ll, pts) sorted arbitrarily, find the pair
+        of lane boundaries that bracket y=0 (the car centreline).
+
+        Left boundary  = line with y > 0 closest to y=0.
+        Right boundary = line with y < 0 closest to y=0 (least negative).
+
+        If all detected lines are on one side (e.g. car near a boundary),
+        the two closest to y=0 are returned as left and right respectively.
+        """
+        # Sort descending by median y: leftmost first
+        sorted_lines = sorted(car_lines, key=lambda t: t[0], reverse=True)
+
+        left_candidates  = [(m, pts) for m, _, pts in sorted_lines if m >= 0]
+        right_candidates = [(m, pts) for m, _, pts in sorted_lines if m <  0]
+
+        if left_candidates and right_candidates:
+            # Ideal case: lines on both sides.  Pick those closest to y=0.
+            left_pts  = left_candidates[-1][1]   # smallest positive y
+            right_pts = right_candidates[0][1]   # least-negative y
+        elif left_candidates:
+            # All lines to the left; take the two closest to the car
+            left_pts  = left_candidates[-1][1]
+            right_pts = left_candidates[-2][1] if len(left_candidates) >= 2 else []
+        else:
+            # All lines to the right; take the two closest to the car
+            right_pts = right_candidates[0][1]
+            left_pts  = right_candidates[1][1] if len(right_candidates) >= 2 else []
+
+        return left_pts, right_pts
+
+    # ------------------------------------------------------------------
+    # Pixel → car-frame conversion helpers
+    # ------------------------------------------------------------------
+    def _hough_line_to_car_pts(self, ll, h, w, roi_top):
+        """Sample a Hough line model into car-frame (x, y) points, near-to-far."""
         m, b = ll['coeffs']
         pts  = []
         for y_px in np.linspace(h - 1, roi_top, N_SAMPLES):
             x_px = float(np.clip(m * y_px + b, 0, w - 1))
-            x_car, y_car = _px_to_car(x_px, y_px, self.H)
+            x_car, y_car = transform_uv_to_xy(self.H, x_px, y_px)
             if x_car > 0.0:
                 pts.append((x_car, y_car))
-
         pts.sort(key=lambda p: p[0])
         return pts
 
-    def _publish_debug(self, frame, best_left, best_right, left_pts, right_pts, roi_top):
+    def _spine_to_car_pts(self, spine):
+        """
+        Convert a blob spine (list of image-space (x, y) points, bottom-to-top)
+        into car-frame (x, y) points, near-to-far.
+        """
+        pts = []
+        for u, v in spine:
+            x_car, y_car = transform_uv_to_xy(self.H, float(u), float(v))
+            if x_car > 0.0:
+                pts.append((x_car, y_car))
+        pts.sort(key=lambda p: p[0])
+        return pts
+
+    # ------------------------------------------------------------------
+    # Debug image
+    # ------------------------------------------------------------------
+    def _publish_debug(self, frame, debug_lines, roi_top):
         dbg = frame.copy()
         h, w = dbg.shape[:2]
 
-        # ROI boundary
         cv2.line(dbg, (0, roi_top), (w, roi_top), (128, 128, 128), 1)
 
-        # Draw detected line segments
-        for ll, color in [(best_left, (0, 255, 0)), (best_right, (0, 255, 255))]:
+        colors = [(0, 255, 0), (0, 255, 255), (255, 165, 0), (255, 0, 255)]
+        for i, ll in enumerate(debug_lines):
             if ll is None:
                 continue
+            color = colors[i % len(colors)]
             p1, p2 = ll['segment']
             cv2.line(dbg, p1, p2, color, 2)
             cv2.circle(dbg, p1, 4, color, -1)
             cv2.circle(dbg, p2, 4, color, -1)
 
-        # Indicate number of lines
-        n_left  = 1 if best_left  else 0
-        n_right = 1 if best_right else 0
-        cv2.putText(dbg, "L=%d R=%d" % (n_left, n_right),
+        cv2.putText(dbg, "lines=%d" % len(debug_lines),
                     (4, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         self.debug_pub.publish(self.bridge.cv2_to_imgmsg(dbg, "bgr8"))

@@ -1,10 +1,61 @@
 <launch>
-  <!-- Lane follower in simulation.
-       Use test_lane_publisher to feed synthetic /left_lane_line / /right_lane_line
-       without a real camera, or run lane_detector for camera-based detection. -->
+  <!-- ═══════════════════════════════════════════════════════════════════
+       Lane-following in simulation — Part A: The Great Snail Race
+       ═══════════════════════════════════════════════════════════════════
 
+       Two modes:
+         camera=true  — run lane_detector against the simulated camera feed
+         camera=false — use test_lane_publisher for synthetic paths (no camera needed)
+
+       Run with:
+         ros2 launch final_challenge lane_follow_sim.launch.xml
+         ros2 launch final_challenge lane_follow_sim.launch.xml camera:=true track_side:=right
+  -->
+
+  <arg name="camera"        default="false"
+       description="Set true to run lane_detector with a simulated camera topic"/>
+  <arg name="track_side"    default="left"
+       description="Which lane boundary to track: left or right"/>
+  <arg name="inward_offset" default="0.30"
+       description="Metres to drive inside the chosen boundary"/>
+  <arg name="nominal_speed" default="2.0"
+       description="Target speed on straights (m/s)"/>
+  <arg name="drive_topic"   default="/drive"
+       description="AckermannDriveStamped drive topic (simulator listens on /drive)"/>
+
+  <!-- ── Optional vision node (only when a camera feed is available) ── -->
+  <node if="$(var camera)"
+        pkg="final_challenge" exec="lane_detector" output="screen"/>
+
+  <!-- ── Synthetic path publisher (only when camera=false) ─────────── -->
+  <node unless="$(var camera)"
+        pkg="final_challenge" exec="test_lane_publisher" output="screen"/>
+
+  <!-- ── Control: pure-pursuit on the selected boundary ────────────── -->
   <node pkg="final_challenge" exec="boundary_pure_pursuit" output="screen">
-    <param name="drive_topic" value="/drive"/>
-    <param name="track_side"  value="left"/>
+    <param name="drive_topic"         value="$(var drive_topic)"/>
+    <param name="track_side"          value="$(var track_side)"/>
+    <param name="inward_offset"       value="$(var inward_offset)"/>
+    <param name="nominal_speed"       value="$(var nominal_speed)"/>
+
+    <param name="lookahead_distance"           value="1.2"/>
+    <param name="lost_line_lookahead_distance" value="0.9"/>
+    <param name="min_lookahead_distance"       value="0.5"/>
+
+    <param name="lost_line_speed" value="0.8"/>
+    <param name="min_speed"       value="0.5"/>
+    <param name="max_speed"       value="3.0"/>
+
+    <param name="curvature_speed_gain"     value="1.2"/>
+    <param name="curvature_lookahead_gain" value="2.0"/>
+
+    <param name="stale_path_timeout"  value="0.75"/>
+    <param name="fresh_msg_timeout"   value="0.2"/>
+    <param name="min_path_arc_length" value="0.3"/>
+    <param name="stop_if_no_path"     value="true"/>
+
+    <param name="steering_alpha"     value="0.35"/>
+    <param name="max_steering_angle" value="0.40"/>
   </node>
+
 </launch>

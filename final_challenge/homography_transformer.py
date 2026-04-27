@@ -39,6 +39,27 @@ PTS_GROUND_PLANE = [[88.00, 14.00],
 
 METERS_PER_CM = 0.01
 
+# used for lane_detector
+def build_homography():
+    """Build and return the 3x3 homography matrix from the calibration points above."""
+    np_pts_image  = np.float32(np.array(PTS_IMAGE_PLANE)[:, np.newaxis, :])
+    np_pts_ground = np.float32((np.array(PTS_GROUND_PLANE) * METERS_PER_CM)[:, np.newaxis, :])
+    H, _ = cv2.findHomography(np_pts_image, np_pts_ground)
+    return H
+
+
+def transform_uv_to_xy(H, u, v):
+    """
+    Transform an image pixel (u, v) to car-frame (x, y) in metres using H.
+
+    u, v : pixel coordinates — origin top-left, u right, v down.
+    x    : metres forward from the car.
+    y    : metres left of the car.
+    """
+    p = np.dot(H, np.array([[u], [v], [1.0]]))
+    scale = 1.0 / p[2, 0]
+    return float(p[0, 0] * scale), float(p[1, 0] * scale)
+
 
 class HomographyTransformer(Node):
     def __init__(self):
@@ -51,17 +72,7 @@ class HomographyTransformer(Node):
         if not len(PTS_GROUND_PLANE) == len(PTS_IMAGE_PLANE):
             rclpy.logerr("ERROR: PTS_GROUND_PLANE and PTS_IMAGE_PLANE should be of same length")
 
-        # Initialize data into a homography matrix
-
-        np_pts_ground = np.array(PTS_GROUND_PLANE)
-        np_pts_ground = np_pts_ground * METERS_PER_CM
-        np_pts_ground = np.float32(np_pts_ground[:, np.newaxis, :])
-
-        np_pts_image = np.array(PTS_IMAGE_PLANE)
-        np_pts_image = np_pts_image * 1.0
-        np_pts_image = np.float32(np_pts_image[:, np.newaxis, :])
-
-        self.h, err = cv2.findHomography(np_pts_image, np_pts_ground)
+        self.h = build_homography()
 
         self.get_logger().info("Homography Transformer Initialized")
 
@@ -86,20 +97,10 @@ class HomographyTransformer(Node):
         The top left pixel is the origin, u axis increases to right, and v axis
         increases down.
 
-        Returns a normal non-np 1x2 matrix of xy displacement vector from the
-        camera to the point on the ground plane.
-        Camera points along positive x axis and y axis increases to the left of
-        the camera.
-
-        Units are in meters.
+        Returns (x, y) displacement in metres from the camera to the point on
+        the ground plane.  x is forward, y is left of the car.
         """
-        homogeneous_point = np.array([[u], [v], [1]])
-        xy = np.dot(self.h, homogeneous_point)
-        scaling_factor = 1.0 / xy[2, 0]
-        homogeneous_xy = xy * scaling_factor
-        x = homogeneous_xy[0, 0]
-        y = homogeneous_xy[1, 0]
-        return x, y
+        return transform_uv_to_xy(self.h, u, v)
 
     def draw_marker(self, cone_x, cone_y, message_frame):
         """

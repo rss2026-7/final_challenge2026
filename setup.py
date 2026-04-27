@@ -8,7 +8,7 @@ setup(
     name=package_name,
     version='0.0.0',
 
-    packages=[package_name, package_name + '.computer_vision'],
+    packages=[package_name],
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
@@ -23,12 +23,12 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'lane_detector = final_challenge.lane_detector:main',
-            'boundary_pure_pursuit = final_challenge.lane_follower:main',
-            'test_lane_publisher = final_challenge.test_lane_publisher:main',
-            'state_machine = final_challenge2026.state_machine:main',
-            'basement_point_publisher = final_challenge2026.basement_point_publisher:main',
-
+            'lane_detector           = final_challenge.lane_detector:main',
+            'boundary_pure_pursuit   = final_challenge.lane_follower:main',
+            'test_lane_publisher     = final_challenge.test_lane_publisher:main',
+            'state_machine           = final_challenge.state_machine:main',
+            'basement_point_publisher = final_challenge.basement_point_publisher:main',
+            'homography_transformer  = final_challenge.homography_transformer:main',
         ],
     },
 )
