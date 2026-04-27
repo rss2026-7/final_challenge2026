@@ -1,20 +1,31 @@
 <?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-    <name>final_challenge2026</name>
-    <version>0.0.0</version>
-    <description>Mrs. Puff Boating School — RSS Final Challenge Part B</description>
-    <maintainer email="todo@todo.todo">Team 7</maintainer>
-    <license>Apache License, Version 2.0</license>
+  <name>final_challenge</name>
+  <version>0.0.0</version>
+  <description>RSS 2026 Final Challenge — lane following and boating school</description>
+  <maintainer email="rss2026-7@mit.edu">rss2026-7</maintainer>
+  <license>MIT</license>
+  
 
-    <buildtool_depend>ament_python</buildtool_depend>
 
-    <exec_depend>rclpy</exec_depend>
-    <exec_depend>geometry_msgs</exec_depend>
-    <exec_depend>nav_msgs</exec_depend>
-    <exec_depend>std_msgs</exec_depend>
-    <exec_depend>ackermann_msgs</exec_depend>
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>ackermann_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>visual_servoing</depend>
 
-    <export>
-        <build_type>ament_python</build_type>
-    </export>
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+
 </package>

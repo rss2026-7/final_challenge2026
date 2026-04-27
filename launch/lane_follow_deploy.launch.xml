@@ -1,0 +1,11 @@
+<launch>
+  <!-- Lane follower on the real robot.
+       Set track_side to "left" or "right" depending on assigned lane. -->
+
+  <node pkg="final_challenge" exec="lane_detector" output="screen"/>
+
+  <node pkg="final_challenge" exec="boundary_pure_pursuit" output="screen">
+    <param name="drive_topic"  value="/vesc/low_level/input/navigation"/>
+    <param name="track_side"   value="left"/>
+  </node>
+</launch>
