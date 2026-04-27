@@ -1,11 +1,13 @@
 import glob
-from setuptools import setup
+from setuptools import find_packages, setup
 
 package_name = 'final_challenge'
+
 
 setup(
     name=package_name,
     version='0.0.0',
+
     packages=[package_name, package_name + '.computer_vision'],
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
@@ -24,6 +26,9 @@ setup(
             'lane_detector = final_challenge.lane_detector:main',
             'boundary_pure_pursuit = final_challenge.lane_follower:main',
             'test_lane_publisher = final_challenge.test_lane_publisher:main',
+            'state_machine = final_challenge2026.state_machine:main',
+            'basement_point_publisher = final_challenge2026.basement_point_publisher:main',
+
         ],
     },
 )
