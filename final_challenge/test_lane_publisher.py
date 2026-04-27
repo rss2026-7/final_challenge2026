@@ -45,7 +45,7 @@ class TestLanePublisher(Node):
         super().__init__("test_lane_publisher")
 
         self.declare_parameter("mode", "straight")
-        self.declare_parameter("lane_width", 0.6)       # meters between lines
+        self.declare_parameter("lane_width", 1.22)       # meters between lines
         self.declare_parameter("num_points", 30)
         self.declare_parameter("point_spacing", 0.10)    # meters between points
         self.declare_parameter("curve_radius", 3.0)      # meters (for curve modes)

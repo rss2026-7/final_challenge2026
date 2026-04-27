@@ -1,18 +1,23 @@
 <?xml version="1.0"?>
 <package format="3">
-    <name>final_challenge2026</name>
-    <version>0.0.0</version>
-    <description>Mrs. Puff Boating School — RSS Final Challenge Part B</description>
-    <maintainer email="todo@todo.todo">Team 7</maintainer>
-    <license>Apache License, Version 2.0</license>
+    <name>final_challenge</name>
+    <version>0.0.1</version>
+    <description>RSS Final Challenge 2026 – lane-following controller</description>
+
+    <maintainer email="kevinhuang@todo.todo">kevinhuang</maintainer>
+    <license>MIT</license>
 
     <buildtool_depend>ament_python</buildtool_depend>
 
+    <!-- Runtime dependencies -->
     <exec_depend>rclpy</exec_depend>
     <exec_depend>geometry_msgs</exec_depend>
     <exec_depend>nav_msgs</exec_depend>
-    <exec_depend>std_msgs</exec_depend>
     <exec_depend>ackermann_msgs</exec_depend>
+    <exec_depend>visualization_msgs</exec_depend>
+    <exec_depend>std_msgs</exec_depend>
+    <exec_depend>sensor_msgs</exec_depend>
+
 
     <export>
         <build_type>ament_python</build_type>

@@ -1,0 +1,44 @@
+# ============================================================
+# BoundaryPurePursuit – default parameter file
+# ============================================================
+
+boundary_pure_pursuit:
+  ros__parameters:
+    # ----- Topics -----
+    left_line_topic: "/left_lane_line"
+    right_line_topic: "/right_lane_line"
+    drive_topic: "/drive"
+
+    # ----- Which boundary to follow -----
+    track_side: "left"            # "left" or "right"
+
+    # ----- Vehicle geometry -----
+    wheelbase: 0.33               # meters (RACECAR default)
+
+    # ----- Lookahead -----
+    lookahead_distance: 1.2       # meters – normal operation
+    lost_line_lookahead_distance: 0.9   # meters – when using stale path
+    min_lookahead_distance: 0.5   # meters – lower bound for adaptive
+
+    # ----- Speed -----
+    nominal_speed: 2.2            # m/s – normal operation
+    lost_line_speed: 0.9          # m/s – when using stale path
+    min_speed: 0.6
+    max_speed: 3.5
+
+    # ----- Steering -----
+    max_steering_angle: 0.40      # radians
+    steering_alpha: 0.35          # low-pass filter (0 = max smooth, 1 = no filter)
+
+    # ----- Curvature gains -----
+    curvature_speed_gain: 1.2     # speed reduction per unit curvature
+    curvature_lookahead_gain: 2.0 # lookahead reduction per unit curvature
+
+    # ----- Boundary offset -----
+    inward_offset: 0.15           # meters inside the chosen boundary
+
+    # ----- Robustness -----
+    fresh_msg_timeout: 0.2        # seconds – max age for a "fresh" message
+    stale_path_timeout: 0.75      # seconds – how long to trust old path
+    min_path_arc_length: 0.3      # meters – reject paths shorter than this
+    stop_if_no_path: true         # stop car when no usable path remains
