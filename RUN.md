@@ -11,26 +11,28 @@ source install/setup.bash
 
 ---
 
-## Simulator
+## Simulator — ground truth odom (no PF)
 
-The sim uses ground-truth odometry on `/odom` and drive commands on `/drive`.
-Override the state machine defaults with `--ros-args` flags.
+Fastest way to test the navigation loop. The simulator publishes `/odom` as perfect
+ground-truth pose, so no particle filter is needed. Override the state machine defaults
+to match the sim topics.
 
 **Terminal 1 — simulator + RViz**
 ```bash
 ros2 launch racecar_simulator simulate.launch.xml
 ```
 
-**Terminal 2 — path planner + pure pursuit follower (Lab 6)**
+**Terminal 2 — path planner + pure pursuit follower**
 ```bash
 ros2 launch path_planning sim_plan_follow.launch.xml
 ```
+Uses `sim_config.yaml`: planner and follower both subscribe to `/odom`, drive on `/drive`.
 
 **Terminal 3 — basement point publisher**
 ```bash
 ros2 run final_challenge2026 basement_point_publisher
 ```
-Then in RViz select the **Publish Point** tool (press `G`) and click two goal locations on the map.
+In RViz select the **Publish Point** tool (press `G`) and click two goal locations on the map.
 
 **Terminal 4 — state machine**
 ```bash
@@ -38,6 +40,43 @@ ros2 run final_challenge2026 state_machine --ros-args \
   -p odom_topic:=/odom \
   -p drive_topic:=/drive
 ```
+
+---
+
+## Simulator — with particle filter (closer to real robot)
+
+Runs the full PF localization stack in sim. The PF subscribes to `/odom` (sim wheel
+odometry as motion model input) and `/scan` (sim LiDAR), and publishes corrected pose
+to `/pf/pose/odom`. The planner, follower, and state machine all use that corrected pose.
+Use this mode when you want to test localization behavior before going to the real robot.
+
+**Terminal 1 — simulator + RViz**
+```bash
+ros2 launch racecar_simulator simulate.launch.xml
+```
+
+**Terminal 2 — path planner + follower + particle filter**
+```bash
+ros2 launch path_planning pf_sim_plan_follow.launch.xml
+```
+Uses `pf_sim_config.yaml`: planner and follower subscribe to `/pf/pose/odom`, drive on `/drive`.
+PF uses `pf_config.yaml`: reads `/odom` and `/scan`, publishes to `/pf/pose/odom`.
+
+**Before Terminal 3:** in RViz, use the **2D Pose Estimate** tool to set the robot's
+initial position on the map. The PF will not localize until this is done.
+
+**Terminal 3 — basement point publisher**
+```bash
+ros2 run final_challenge2026 basement_point_publisher
+```
+In RViz select the **Publish Point** tool (press `G`) and click two goal locations on the map.
+
+**Terminal 4 — state machine**
+```bash
+ros2 run final_challenge2026 state_machine --ros-args -p drive_topic:=/drive
+```
+`odom_topic` defaults to `/pf/pose/odom` — no override needed. Only `drive_topic` needs
+to be overridden from the real-robot default.
 
 ---
 
