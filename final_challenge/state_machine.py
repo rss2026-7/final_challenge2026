@@ -120,18 +120,13 @@ class FinalChallengeStateMachine(Node):
             10,
         )
 
-        # ------------------------------------------------------------------
         # [WEIMING] YOLO sign detection result
-        # Weiming's node publishes the detected object class as a string, e.g.:
-        #   "parking_meter" | "fire_hydrant" | "bird"
-        # on /sign_detection/result when detection is triggered.
-        # ------------------------------------------------------------------
-        # self.sign_sub = self.create_subscription(
-        #     String,
-        #     "/sign_detection/result",
-        #     self._sign_cb,
-        #     10,
-        # )
+        self.sign_sub = self.create_subscription(
+            String,
+            "/sign_detection/result",
+            self._sign_cb,
+            10,
+        )
 
         # ------------------------------------------------------------------
         # [KEVIN] Parking controller done signal
@@ -157,13 +152,10 @@ class FinalChallengeStateMachine(Node):
             AckermannDriveStamped, self.drive_topic, 10
         )
 
-        # ------------------------------------------------------------------
         # [WEIMING] Trigger sign detection
-        # Publish True here to tell Weiming's node to start detecting objects.
-        # ------------------------------------------------------------------
-        # self.trigger_detection_pub = self.create_publisher(
-        #     Bool, "/sign_detection/trigger", 10
-        # )
+        self.trigger_detection_pub = self.create_publisher(
+            Bool, "/sign_detection/trigger", 10
+        )
 
         # ------------------------------------------------------------------
         # [KEVIN] Parking trigger
@@ -210,12 +202,10 @@ class FinalChallengeStateMachine(Node):
                 f"Start pose saved: ({p.x:.2f}, {p.y:.2f}, yaw={math.degrees(yaw):.1f} deg)"
             )
 
-    # ------------------------------------------------------------------
-    # [WEIMING] Uncomment when YOLO sign detection is ready
-    # ------------------------------------------------------------------
-    # def _sign_cb(self, msg: String):
-    #     self.detected_sign = msg.data
-    #     self.get_logger().info(f"Sign detected: {msg.data}")
+    # [WEIMING]
+    def _sign_cb(self, msg: String):
+        self.detected_sign = msg.data
+        self.get_logger().info(f"Sign detected: {msg.data}")
 
     # ------------------------------------------------------------------
     # [KEVIN] Uncomment when parking controller is ready
@@ -328,38 +318,28 @@ class FinalChallengeStateMachine(Node):
         Reached the goal zone. Reset detection state and trigger YOLO.
         """
         self.detected_sign = None
-
-        # ------------------------------------------------------------------
-        # [WEIMING] Trigger sign detection here.
-        # Publish True to /sign_detection/trigger so Weiming's YOLO node
-        # starts classifying the three roadside objects at this location.
-        # ------------------------------------------------------------------
-        # trigger = Bool()
-        # trigger.data = True
-        # self.trigger_detection_pub.publish(trigger)
-
+        trigger = Bool()
+        trigger.data = True
+        self.trigger_detection_pub.publish(trigger)
         self.get_logger().info(
-            f"Arrived at location {self.current_goal_idx + 1}. "
-            f"Triggering sign detection. [WEIMING placeholder]"
+            f"Arrived at location {self.current_goal_idx + 1}. Triggering sign detection."
         )
         self._to(State.DETECTING_SIGN)
 
     def _detecting_sign(self):
         """
-        Wait for YOLO to identify which of the three objects is the parking meter.
-        self.detected_sign is set by _sign_cb() (Weiming's callback).
-
-        PLACEHOLDER: auto-advance for testing until YOLO is integrated.
-        Remove the else-branch and the warning below once Weiming's node is live.
+        Wait for YOLO to identify which of the three objects is at this location.
+        self.detected_sign is set by _sign_cb() once the detector publishes a result.
         """
+        if self.detected_sign is None:
+            return  # still waiting for YOLO result
+
         if self.detected_sign == "parking_meter":
             self.get_logger().info("Parking meter confirmed — handing off to parking controller.")
             self.parking_done = False
 
             # ------------------------------------------------------------------
             # [KEVIN] Send parking target to Kevin's controller.
-            # Populate target_pose with the detected meter's world pose (from
-            # Weiming's detection + homography).
             # ------------------------------------------------------------------
             # target_pose = PoseStamped()
             # target_pose.header.frame_id = "map"
@@ -369,16 +349,24 @@ class FinalChallengeStateMachine(Node):
             # self.parking_target_pub.publish(target_pose)
 
             self._to(State.PARKING)
-
         else:
-            # PLACEHOLDER — remove once Weiming's YOLO node is integrated
-            self.get_logger().warn(
-                "PLACEHOLDER: YOLO not yet integrated. "
-                "Auto-advancing to PARKING for testing.",
-                throttle_duration_sec=2.0,
+            self.get_logger().info(
+                f"Detected '{self.detected_sign}' — not a parking meter. Skipping location."
             )
-            self.parking_done = False
-            self._to(State.PARKING)
+            self._advance_to_next_goal()
+
+    def _advance_to_next_goal(self):
+        self.current_goal_idx += 1
+        if self.current_goal_idx < len(self.goal_locations):
+            goal = self.goal_locations[self.current_goal_idx]
+            self._send_goal(goal[0], goal[1])
+            self._to(State.PLANNING)
+        elif self.return_to_start and self.start_pose is not None:
+            self.get_logger().info("All locations visited. Returning to start for +2 bonus.")
+            self._send_goal(self.start_pose[0], self.start_pose[1])
+            self._to(State.RETURNING_TO_START)
+        else:
+            self._to(State.DONE)
 
     def _parking(self):
         """
@@ -419,20 +407,7 @@ class FinalChallengeStateMachine(Node):
         self.get_logger().info(
             f"Held for {self.park_duration:.0f}s at location {self.current_goal_idx + 1}."
         )
-        self.current_goal_idx += 1
-
-        if self.current_goal_idx < len(self.goal_locations):
-            # Still more locations to visit
-            goal = self.goal_locations[self.current_goal_idx]
-            self._send_goal(goal[0], goal[1])
-            self._to(State.PLANNING)
-        elif self.return_to_start and self.start_pose is not None:
-            # Both locations done — go back for bonus points
-            self.get_logger().info("All locations visited. Returning to start for +2 bonus.")
-            self._send_goal(self.start_pose[0], self.start_pose[1])
-            self._to(State.RETURNING_TO_START)
-        else:
-            self._to(State.DONE)
+        self._advance_to_next_goal()
 
     def _returning_to_start(self):
         """
