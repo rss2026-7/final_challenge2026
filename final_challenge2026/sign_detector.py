@@ -17,12 +17,13 @@ from cv_bridge import CvBridge
 from ultralytics import YOLO
 
 
-TARGET_CLASSES = {"parking_meter", "fire_hydrant", "bird"}
+TARGET_CLASSES = {"parking_meter", "fire_hydrant", "bird", "traffic light"}
 
 CLASS_COLORS = {
     "parking_meter": (0, 255, 0),
     "fire_hydrant":  (0, 0, 255),
     "bird":          (255, 165, 0),
+    "traffic light": (255, 255, 0),
 }
 
 
