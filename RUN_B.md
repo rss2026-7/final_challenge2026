@@ -17,15 +17,17 @@ Fastest way to test the navigation loop. The simulator publishes `/odom` as perf
 ground-truth pose, so no particle filter is needed. Override the state machine defaults
 to match the sim topics.
 
-**Terminal 1 — simulator + RViz**
+
+**Terminal 1 — path planner + pure pursuit follower**
+```bash
+ros2 launch path_planning sim_plan_follow.launch.xml
+```
+
+**Terminal 2 — simulator + RViz**
 ```bash
 ros2 launch racecar_simulator simulate.launch.xml
 ```
 
-**Terminal 2 — path planner + pure pursuit follower**
-```bash
-ros2 launch path_planning sim_plan_follow.launch.xml
-```
 Uses `sim_config.yaml`: planner and follower both subscribe to `/odom`, drive on `/drive`.
 
 **Terminal 3 — basement point publisher**
@@ -50,15 +52,18 @@ odometry as motion model input) and `/scan` (sim LiDAR), and publishes corrected
 to `/pf/pose/odom`. The planner, follower, and state machine all use that corrected pose.
 Use this mode when you want to test localization behavior before going to the real robot.
 
-**Terminal 1 — simulator + RViz**
+
+
+**Terminal 1 — path planner + follower + particle filter**
+```bash
+ros2 launch path_planning pf_sim_plan_follow.launch.xml
+```
+
+**Terminal 2 — simulator + RViz**
 ```bash
 ros2 launch racecar_simulator simulate.launch.xml
 ```
 
-**Terminal 2 — path planner + follower + particle filter**
-```bash
-ros2 launch path_planning pf_sim_plan_follow.launch.xml
-```
 Uses `pf_sim_config.yaml`: planner and follower subscribe to `/pf/pose/odom`, drive on `/drive`.
 PF uses `pf_config.yaml`: reads `/odom` and `/scan`, publishes to `/pf/pose/odom`.
 
@@ -84,6 +89,14 @@ to be overridden from the real-robot default.
 
 The real robot runs the particle filter and uses `/pf/pose/odom` for localization.
 The state machine defaults are already set for this environment — no overrides needed.
+
+
+
+**Terminal 0 — simulator + RViz**
+```bash
+ros2 launch racecar_simulator simulate.launch.xml
+```
+
 
 **Terminal 1 — path planner + follower + particle filter + safety controller (Lab 6)**
 ```bash
