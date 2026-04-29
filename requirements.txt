@@ -1,0 +1,24 @@
+# Pip-installable dependencies for final_challenge2026.
+#
+# ROS2 packages (rclpy, cv_bridge, sensor_msgs, std_msgs, geometry_msgs,
+# nav_msgs, ackermann_msgs, visualization_msgs, vs_msgs, tf2_ros) are NOT pip
+# packages — they ship with your ROS2 install and must be installed via apt
+# (e.g. `apt install ros-humble-cv-bridge`) or sourced from your ROS2 setup.
+#
+# visual_servoing_pkg pins no versions, so these bounds match the latest
+# stable releases compatible with ROS2 Humble's Python 3.10 toolchain.
+
+# Core CV / numerics — used in stoplight_detection, lane_detector,
+# white_line_detection, color_segmentation, etc.
+numpy>=1.21,<2.0
+opencv-python>=4.5
+
+# Geometry — visual_servoing/parking_controller (scipy.spatial.transform.Rotation)
+scipy>=1.7
+
+# Image utilities — visual_servoing/cone_sim_marker.py
+imutils>=0.5
+
+# YOLO sign / object detection — sign_detector.py, yolo_annotator.py
+ultralytics>=8.0
+torch>=1.13
