@@ -47,13 +47,14 @@ from sensor_msgs.msg import Image, RegionOfInterest
 from ultralytics import YOLO
 
 
-TARGET_CLASSES = {"parking_meter", "fire_hydrant", "bird", "traffic light"}
+TARGET_CLASSES = {"parking_meter", "fire_hydrant", "bird", "traffic light", "person"}
 
 CLASS_COLORS = {
     "parking_meter": (0, 255, 0),
     "fire_hydrant":  (0, 0, 255),
     "bird":          (255, 165, 0),
     "traffic light": (255, 255, 0),
+    "person":        (255, 0, 255),
 }
 
 
