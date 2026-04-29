@@ -1,0 +1,49 @@
+<launch>
+  <!-- ═══════════════════════════════════════════════════════════════════
+       Part B nodes — Mrs. Puff's Boating School
+
+       Starts all Part B nodes in one shot. User still needs to:
+         1. Set 2D Pose Estimate in RViz (PF/real-robot modes)
+         2. Click two goal points with the Publish Point tool (press G)
+
+       Real robot (default):
+         ros2 launch final_challenge part_b.launch.xml
+
+       Simulator:
+         ros2 launch final_challenge part_b.launch.xml sim:=true
+  ═══════════════════════════════════════════════════════════════════ -->
+
+  <arg name="sim" default="false"
+       description="Set true when running in the simulator (overrides odom/drive topics)"/>
+
+  <!-- ── Basement goal point publisher ──────────────────────────────── -->
+  <node pkg="final_challenge" exec="basement_point_publisher" output="screen"/>
+
+  <!-- ── State machine — real robot ─────────────────────────────────── -->
+  <node pkg="final_challenge" exec="state_machine" output="screen"
+        unless="$(var sim)"/>
+
+  <!-- ── State machine — simulator ──────────────────────────────────── -->
+  <node pkg="final_challenge" exec="state_machine" output="screen"
+        if="$(var sim)">
+    <param name="odom_topic"  value="/odom"/>
+    <param name="drive_topic" value="/drive"/>
+  </node>
+
+  <!-- ── Sign detector (also publishes /relative_cone_px for parking) ── -->
+  <node pkg="final_challenge" exec="sign_detector" output="screen"/>
+
+  <!-- ── Homography transformer: /relative_cone_px → /relative_cone ─── -->
+  <node pkg="final_challenge" exec="homography_transformer" output="screen"/>
+
+  <!-- ── Parking controller — real robot ────────────────────────────── -->
+  <node pkg="final_challenge" exec="parking_controller" output="screen"
+        unless="$(var sim)"/>
+
+  <!-- ── Parking controller — simulator ─────────────────────────────── -->
+  <node pkg="final_challenge" exec="parking_controller" output="screen"
+        if="$(var sim)">
+    <param name="drive_topic" value="/drive"/>
+  </node>
+
+</launch>

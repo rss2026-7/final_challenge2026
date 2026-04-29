@@ -11,6 +11,22 @@ source install/setup.bash
 
 ---
 
+## Quick start (launch file)
+
+Instead of opening individual terminals for each Part B node, you can use:
+
+```bash
+# Real robot
+ros2 launch final_challenge part_b.launch.xml
+
+# Simulator
+ros2 launch final_challenge part_b.launch.xml sim:=true
+```
+
+This starts `basement_point_publisher`, `state_machine`, `sign_detector`, `homography_transformer`, and `parking_controller` in one shot. You still need to run the path planner and simulator/RViz separately (see sections below), and do the RViz interactions (2D Pose Estimate + click two goal points).
+
+---
+
 ## Simulator — ground truth odom (no PF)
 
 Fastest way to test the navigation loop. The simulator publishes `/odom` as perfect
