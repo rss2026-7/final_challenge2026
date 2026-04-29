@@ -52,7 +52,7 @@ ros2 run final_challenge sign_detector
 ```bash
 ros2 run final_challenge homography_transformer
 ```
-Converts Weiming's pixel detections on `/relative_cone_px` → metres on `/relative_cone`.
+Converts pixel detections on `/relative_cone_px` → metres on `/relative_cone`.
 
 **Terminal 7 — parking controller** *(required for parking)*
 ```bash
@@ -61,7 +61,7 @@ ros2 run final_challenge parking_controller --ros-args \
 ```
 Waits idle until `/parking/trigger` fires, then servos toward `/relative_cone` and publishes `/parking/done`.
 
-> **Note:** Weiming's YOLO node must also be running to publish `/relative_cone_px`. Without it the parking controller will receive no cone location and sit still.
+> **Note:** `sign_detector` (Terminal 5) publishes `/relative_cone_px` continuously whenever a parking meter is detected.
 
 ---
 
@@ -112,7 +112,7 @@ ros2 run final_challenge sign_detector
 ```bash
 ros2 run final_challenge homography_transformer
 ```
-Converts Weiming's pixel detections on `/relative_cone_px` → metres on `/relative_cone`.
+Converts pixel detections on `/relative_cone_px` → metres on `/relative_cone`.
 
 **Terminal 7 — parking controller** *(required for parking)*
 ```bash
@@ -121,7 +121,7 @@ ros2 run final_challenge parking_controller --ros-args \
 ```
 Waits idle until `/parking/trigger` fires, then servos toward `/relative_cone` and publishes `/parking/done`.
 
-> **Note:** Weiming's YOLO node must also be running to publish `/relative_cone_px`. Without it the parking controller will receive no cone location and sit still.
+> **Note:** `sign_detector` (Terminal 5) publishes `/relative_cone_px` continuously whenever a parking meter is detected.
 
 ---
 
