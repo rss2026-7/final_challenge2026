@@ -85,13 +85,16 @@ except ImportError:
 # Edit these after running the calibration GUI and clicking [Print Values].
 # OpenCV uses H ∈ [0, 179], S ∈ [0, 255], V ∈ [0, 255].
 # Red wraps the hue seam at 0/180, so it needs two intervals.
-DEFAULT_RED_LOW_1   = [0,   120, 90]
-DEFAULT_RED_HIGH_1  = [10,  255, 255]
+DEFAULT_RED_LOW_1   = [0, 0, 204]
+DEFAULT_RED_HIGH_1  = [86, 255, 255]
 DEFAULT_RED_LOW_2   = [170, 120, 90]
 DEFAULT_RED_HIGH_2  = [179, 255, 255]
-DEFAULT_GREEN_LOW   = [40,  90,  90]
-DEFAULT_GREEN_HIGH  = [85,  255, 255]
-MIN_AREA            = 50    # px² — largest contour must exceed this to detect
+DEFAULT_GREEN_LOW   = [40, 90, 90]
+DEFAULT_GREEN_HIGH  = [85, 255, 255]
+MIN_AREA            = 50
+
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 BLUR_KSIZE   = (5, 5)
