@@ -167,3 +167,8 @@ Open a new terminal and run:
 
 ```bash
 ros2 run final_challenge sign_detector
+
+Open a new terminal and run:
+
+```bash
+ros2 run final_challenge stoplight_detection
