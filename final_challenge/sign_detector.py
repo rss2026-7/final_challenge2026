@@ -15,6 +15,7 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
 from cv_bridge import CvBridge
 from ultralytics import YOLO
+from vs_msgs.msg import ConeLocationPixel
 
 
 TARGET_CLASSES = {"parking_meter", "fire_hydrant", "bird", "traffic light"}
@@ -77,6 +78,7 @@ class SignDetectorNode(Node):
 
         self.result_pub = self.create_publisher(String, "/sign_detection/result", 10)
         self.annotated_pub = self.create_publisher(Image, "/sign_detection/annotated_image", 10)
+        self.cone_px_pub = self.create_publisher(ConeLocationPixel, "/relative_cone_px", 10)
 
         self.get_logger().info(
             f"SignDetector ready — model={self.model_name}, device={self.device}, "
@@ -93,7 +95,7 @@ class SignDetectorNode(Node):
             self.active = False
 
     def _image_cb(self, msg: Image) -> None:
-        if not self.active or self.result_published:
+        if not self.active:
             return
 
         try:
@@ -121,8 +123,19 @@ class SignDetectorNode(Node):
             return
 
         best = max(dets, key=lambda d: d.confidence)
-        annotated = self._draw_detection(bgr, best)
 
+        # Continuous: publish pixel location every frame for parking controller servo
+        if best.class_name == "parking_meter":
+            cone_px = ConeLocationPixel()
+            cone_px.u = float((best.x1 + best.x2) / 2)
+            cone_px.v = float(best.y2)  # bottom-center, matches homography calibration
+            self.cone_px_pub.publish(cone_px)
+
+        # One-shot: publish class result and save annotated image
+        if self.result_published:
+            return
+
+        annotated = self._draw_detection(bgr, best)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         save_path = os.path.join(self.save_dir, f"{best.class_name}_{timestamp}.jpg")
         cv2.imwrite(save_path, annotated)
