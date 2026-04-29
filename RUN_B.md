@@ -43,6 +43,11 @@ ros2 run final_challenge state_machine --ros-args \
   -p drive_topic:=/drive
 ```
 
+**Terminal 5 — sign detector**
+```bash
+ros2 run final_challenge sign_detector
+```
+
 ---
 
 ## Simulator — with particle filter (closer to real robot)
@@ -83,6 +88,11 @@ ros2 run final_challenge state_machine --ros-args -p drive_topic:=/drive
 `odom_topic` defaults to `/pf/pose/odom` — no override needed. Only `drive_topic` needs
 to be overridden from the real-robot default.
 
+**Terminal 5 — sign detector**
+```bash
+ros2 run final_challenge sign_detector
+```
+
 ---
 
 ## Real Robot
@@ -116,6 +126,11 @@ Click two goal points in RViz using the **Publish Point** tool.
 ros2 run final_challenge state_machine
 ```
 
+**Terminal 4 — sign detector**
+```bash
+ros2 run final_challenge sign_detector
+```
+
 ---
 
 ## Do you need launch files?
@@ -139,7 +154,7 @@ launch file becomes more valuable to start everything cleanly in one shot.
 | `/goal_pose` | pub | Sends navigation goal to Lab 6 planner |
 | `/vesc/ackermann_cmd` | pub | Stop commands (real robot) |
 | `/drive` | pub | Stop commands (sim only, pass via --ros-args) |
-| `/sign_detection/trigger` | pub | [WEIMING] trigger YOLO detection |
-| `/sign_detection/result` | sub | [WEIMING] detected object class |
+| `/sign_detection/trigger` | pub | trigger YOLO detection (sign_detector node) |
+| `/sign_detection/result` | sub | detected object class — "parking_meter", "fire_hydrant", or "bird" |
 | `/parking/trigger` | pub | [KEVIN] start parking controller |
 | `/parking/done` | sub | [KEVIN] parking complete signal |
