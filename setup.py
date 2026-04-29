@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'lane_detector            = final_challenge.lane_detector:main',
+            'parking_controller       = final_challenge.parking_controller:main',
             'boundary_pure_pursuit    = final_challenge.lane_follower:main',
             'test_lane_publisher      = final_challenge.test_lane_publisher:main',
             'state_machine            = final_challenge.state_machine:main',

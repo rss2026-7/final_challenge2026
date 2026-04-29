@@ -137,12 +137,12 @@ class FinalChallengeStateMachine(Node):
         # Kevin's parking controller publishes True on /parking/done once the
         # car has stopped within 1 m of the correct meter.
         # ------------------------------------------------------------------
-        # self.parking_done_sub = self.create_subscription(
-        #     Bool,
-        #     "/parking/done",
-        #     self._parking_done_cb,
-        #     10,
-        # )
+        self.parking_done_sub = self.create_subscription(
+            Bool,
+            "/parking/done",
+            self._parking_done_cb,
+            10,
+        )
 
         # ------------------------------------------------------------------ #
         #  Publishers                                                          #
@@ -167,9 +167,9 @@ class FinalChallengeStateMachine(Node):
         # His node steers toward the YOLO bounding box centroid and stops
         # when homography distance <= 1 m. No world-frame pose needed.
         # ------------------------------------------------------------------
-        # self.parking_trigger_pub = self.create_publisher(
-        #     Bool, "/parking/trigger", 10
-        # )
+        self.parking_trigger_pub = self.create_publisher(
+            Bool, "/parking/trigger", 10
+        )
 
         # ------------------------------------------------------------------ #
         #  State machine timer — runs at 10 Hz                                #
@@ -211,12 +211,9 @@ class FinalChallengeStateMachine(Node):
         self.detected_sign = msg.data
         self.get_logger().info(f"Sign detected: {msg.data}")
 
-    # ------------------------------------------------------------------
-    # [KEVIN] Uncomment when parking controller is ready
-    # ------------------------------------------------------------------
-    # def _parking_done_cb(self, msg: Bool):
-    #     if msg.data:
-    #         self.parking_done = True
+    def _parking_done_cb(self, msg: Bool):
+        if msg.data:
+            self.parking_done = True
 
     # ======================================================================
     #  Helpers
@@ -358,16 +355,9 @@ class FinalChallengeStateMachine(Node):
             self.get_logger().info("Parking meter confirmed — handing off to parking controller.")
             self.parking_done = False
 
-            # ------------------------------------------------------------------
-            # [KEVIN] Send parking target to Kevin's controller.
-            # ------------------------------------------------------------------
-            # target_pose = PoseStamped()
-            # target_pose.header.frame_id = "map"
-            # target_pose.header.stamp = self.get_clock().now().to_msg()
-            # target_pose.pose.position.x = <meter_world_x>
-            # target_pose.pose.position.y = <meter_world_y>
-            # self.parking_target_pub.publish(target_pose)
-
+            trigger = Bool()
+            trigger.data = True
+            self.parking_trigger_pub.publish(trigger)
             self._to(State.PARKING)
         else:
             self.get_logger().info(
@@ -390,26 +380,14 @@ class FinalChallengeStateMachine(Node):
 
     def _parking(self):
         """
-        Kevin's visual-servo parking controller steers toward the detected
-        meter's bounding box centroid and stops when homography distance <= 1 m.
-        No localization or world-frame pose required.
-        self.parking_done is set by _parking_done_cb() once Kevin's node signals done.
-
-        PLACEHOLDER: auto-advance for testing until Kevin's controller is live.
-        Remove the else-branch once integrated.
+        Wait for parking_controller.py to finish its visual-servo approach.
+        self.parking_done is set True by _parking_done_cb() when /parking/done
+        receives True from the controller.
+        Until then the state machine simply idles here at 10 Hz while the
+        parking controller owns the drive topic.
         """
         if self.parking_done:
             self.get_logger().info("Parking complete. Starting 5-second hold.")
-            self._stop()
-            self.park_start_time = self.get_clock().now()
-            self._to(State.PARKED)
-        else:
-            # PLACEHOLDER — remove once Kevin's visual-servo controller is integrated
-            self.get_logger().warn(
-                "PLACEHOLDER: parking controller not yet integrated. "
-                "Auto-advancing to PARKED for testing.",
-                throttle_duration_sec=2.0,
-            )
             self._stop()
             self.park_start_time = self.get_clock().now()
             self._to(State.PARKED)
