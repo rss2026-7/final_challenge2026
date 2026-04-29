@@ -21,6 +21,11 @@
   <arg name="drive_topic"   default="/vesc/low_level/input/navigation"
        description="AckermannDriveStamped topic consumed by the VESC"/>
 
+  <!-- ── ZED camera ────────────────────────────────────────────────── -->
+  <include file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py">
+    <arg name="camera_model" value="zed"/>
+  </include>
+
   <!-- ── Vision: white-line detection + homography → /left_lane_line, /right_lane_line -->
   <node pkg="final_challenge" exec="lane_detector" output="screen"/>
 
