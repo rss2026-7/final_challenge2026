@@ -210,10 +210,14 @@ launch file becomes more valuable to start everything cleanly in one shot.
 
 ### How to run
 
-Open a new terminal and run:
-
+**Terminal 1 — path planner + pure pursuit follower**
 ```bash
 ros2 run final_challenge sign_detector
-'''
+```
+
+**Terminal 2 — simulator + RViz**
+```bash
+ros2 run final_challenge stoplight_detection
+```
 
 
