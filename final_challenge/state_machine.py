@@ -51,6 +51,7 @@ class State(Enum):
     DETECTING_SIGN      = auto()  # Waiting for YOLO to identify the parking meter
     PARKING             = auto()  # Kevin's parking controller executing maneuver
     PARKED              = auto()  # Holding 5-second stop in front of correct meter
+    RECOVERING          = auto()  # Backing out of parking spot before replanning
     RETURNING_TO_START  = auto()  # Optional: navigating back to start for bonus pts
     DONE                = auto()  # All tasks complete
 
@@ -90,6 +91,7 @@ class FinalChallengeStateMachine(Node):
         self.current_pose       = None  # (x, y, yaw) — updated continuously from odom
         self.start_pose         = None  # saved once on first odom message
         self.park_start_time    = None
+        self.recover_start_time = None  # time RECOVERING state was entered
         self.plan_sent_time     = None  # time goal was sent to planner
 
         # Signals set by teammate callbacks (None/False until integrated)
@@ -224,6 +226,11 @@ class FinalChallengeStateMachine(Node):
         cmd.drive.steering_angle = 0.0
         self.drive_pub.publish(cmd)
 
+    def _start_recovery(self):
+        """Transition into RECOVERING so the robot backs up before every replan."""
+        self.recover_start_time = self.get_clock().now()
+        self._to(State.RECOVERING)
+
     def _dist_to(self, xy):
         """Euclidean distance from current pose to (x, y)."""
         if self.current_pose is None:
@@ -266,6 +273,7 @@ class FinalChallengeStateMachine(Node):
             State.DETECTING_SIGN:     self._detecting_sign,
             State.PARKING:            self._parking,
             State.PARKED:             self._parked,
+            State.RECOVERING:         self._recovering,
             State.RETURNING_TO_START: self._returning_to_start,
             State.DONE:               self._done,
         }[self.state]()
@@ -353,7 +361,7 @@ class FinalChallengeStateMachine(Node):
             self.get_logger().info(
                 f"Detected '{self.detected_sign}' — not a parking meter. Skipping location."
             )
-            self._advance_to_next_goal()
+            self._start_recovery()
 
     def _advance_to_next_goal(self):
         self.current_goal_idx += 1
@@ -405,9 +413,28 @@ class FinalChallengeStateMachine(Node):
             return
 
         self.get_logger().info(
-            f"Held for {self.park_duration:.0f}s at location {self.current_goal_idx + 1}."
+            f"Held for {self.park_duration:.0f}s at location {self.current_goal_idx + 1}. "
+            "Backing out before replanning."
         )
-        self._advance_to_next_goal()
+        self._start_recovery()
+
+    def _recovering(self):
+        """
+        Back slowly out of the parking spot for 1.5 s so the robot is clear of
+        the meter and back in open corridor space before replanning.  No pose
+        knowledge required — open-loop reverse gives the particle filter time to
+        reconverge on familiar geometry before the next goal is issued.
+        """
+        elapsed = (self.get_clock().now() - self.recover_start_time).nanoseconds / 1e9
+        if elapsed < 1.5:
+            cmd = AckermannDriveStamped()
+            cmd.drive.speed = -0.5          # slow reverse
+            cmd.drive.steering_angle = 0.0  # straight back
+            self.drive_pub.publish(cmd)
+        else:
+            self._stop()
+            self.get_logger().info("Recovery complete — resuming navigation.")
+            self._advance_to_next_goal()
 
     def _returning_to_start(self):
         """
