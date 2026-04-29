@@ -30,13 +30,13 @@ Uses `sim_config.yaml`: planner and follower both subscribe to `/odom`, drive on
 
 **Terminal 3 — basement point publisher**
 ```bash
-ros2 run final_challenge2026 basement_point_publisher
+ros2 run final_challenge basement_point_publisher
 ```
 In RViz select the **Publish Point** tool (press `G`) and click two goal locations on the map.
 
 **Terminal 4 — state machine**
 ```bash
-ros2 run final_challenge2026 state_machine --ros-args \
+ros2 run final_challenge state_machine --ros-args \
   -p odom_topic:=/odom \
   -p drive_topic:=/drive
 ```
@@ -67,13 +67,13 @@ initial position on the map. The PF will not localize until this is done.
 
 **Terminal 3 — basement point publisher**
 ```bash
-ros2 run final_challenge2026 basement_point_publisher
+ros2 run final_challenge basement_point_publisher
 ```
 In RViz select the **Publish Point** tool (press `G`) and click two goal locations on the map.
 
 **Terminal 4 — state machine**
 ```bash
-ros2 run final_challenge2026 state_machine --ros-args -p drive_topic:=/drive
+ros2 run final_challenge state_machine --ros-args -p drive_topic:=/drive
 ```
 `odom_topic` defaults to `/pf/pose/odom` — no override needed. Only `drive_topic` needs
 to be overridden from the real-robot default.
@@ -94,13 +94,13 @@ particle filter, safety controller, and a bag recorder all at once.
 
 **Terminal 2 — basement point publisher**
 ```bash
-ros2 run final_challenge2026 basement_point_publisher
+ros2 run final_challenge basement_point_publisher
 ```
 Click two goal points in RViz using the **Publish Point** tool.
 
 **Terminal 3 — state machine**
 ```bash
-ros2 run final_challenge2026 state_machine
+ros2 run final_challenge state_machine
 ```
 
 ---
