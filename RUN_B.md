@@ -17,15 +17,17 @@ Fastest way to test the navigation loop. The simulator publishes `/odom` as perf
 ground-truth pose, so no particle filter is needed. Override the state machine defaults
 to match the sim topics.
 
-**Terminal 1 — simulator + RViz**
+
+**Terminal 1 — path planner + pure pursuit follower**
+```bash
+ros2 launch path_planning sim_plan_follow.launch.xml
+```
+
+**Terminal 2 — simulator + RViz**
 ```bash
 ros2 launch racecar_simulator simulate.launch.xml
 ```
 
-**Terminal 2 — path planner + pure pursuit follower**
-```bash
-ros2 launch path_planning sim_plan_follow.launch.xml
-```
 Uses `sim_config.yaml`: planner and follower both subscribe to `/odom`, drive on `/drive`.
 
 **Terminal 3 — basement point publisher**

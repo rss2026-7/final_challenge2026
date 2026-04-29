@@ -332,8 +332,18 @@ class FinalChallengeStateMachine(Node):
         self.detected_sign is set by _sign_cb() once the detector publishes a result.
         """
         if self.detected_sign is None:
-            return  # still waiting for YOLO result
+        # Check timeout
+            if not hasattr(self, '_detect_start_time') or self._detect_start_time is None:
+                self._detect_start_time = self.get_clock().now()
+            elapsed = (self.get_clock().now() - self._detect_start_time).nanoseconds / 1e9
+            if elapsed > 10.0:  # 10-second timeout
+                self.get_logger().warn("Sign detection timed out — skipping location.")
+                self._detect_start_time = None
+                self._advance_to_next_goal()
+            return
 
+        self._detect_start_time = None  # reset for next time
+     
         if self.detected_sign == "parking_meter":
             self.get_logger().info("Parking meter confirmed — handing off to parking controller.")
             self.parking_done = False
