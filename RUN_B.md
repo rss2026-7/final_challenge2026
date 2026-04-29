@@ -212,7 +212,7 @@ launch file becomes more valuable to start everything cleanly in one shot.
 
 **Terminal 1 — path planner + pure pursuit follower**
 ```bash
-ros2 run final_challenge sign_detector
+ros2 run final_challenge yolo_node
 ```
 
 **Terminal 2 — simulator + RViz**
