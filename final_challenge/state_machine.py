@@ -347,7 +347,7 @@ class FinalChallengeStateMachine(Node):
             if elapsed > 10.0:  # 10-second timeout
                 self.get_logger().warn("Sign detection timed out — skipping location.")
                 self._detect_start_time = None
-                self._advance_to_next_goal()
+                self._start_recovery()
             return
 
         self._detect_start_time = None  # reset for next time
