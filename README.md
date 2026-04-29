@@ -64,7 +64,7 @@ The race will take place on the legendary Bikini Bottom Johnson Track Loop: a st
 
 Your car's task is to complete the 200-meter loop around the track as fast as possible, while staying in your assigned lane. Any kind of collision (with another car, snail, or with something in Johnson) will seriously jeopardize your racer score and will be penalized heavily. You should have a safety controller running on your car, but be careful that this doesn't stop your car if there is another car driving next to it on the track!
 
-We have provided images and rosbags of the race track in `/racetrack_images` for easier testing/debugging. 
+We have provided images and rosbags of the race track in `/testing_images/racetrack_images` for easier testing/debugging. 
 
 The rosbag can be downloaded at this [link](https://drive.google.com/file/d/1laqouQzSVUhgAsqJVQ08WQdYrOwvVxg0/view?usp=sharing)
 

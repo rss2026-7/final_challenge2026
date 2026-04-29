@@ -462,9 +462,9 @@ if __name__ == "__main__":
 
     # Default: run through all images in a lane directory
     test_dirs = [
-        "racetrack_images/lane_1",
-        "racetrack_images/lane_3",
-        "racetrack_images/lane_6",
+        "testing_images/racetrack_images/lane_1",
+        "testing_images/racetrack_images/lane_3",
+        "testing_images/racetrack_images/lane_6",
     ]
 
     if len(sys.argv) > 1:

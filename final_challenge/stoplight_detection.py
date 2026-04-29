@@ -16,8 +16,8 @@ specular highlights, stray red car paint, etc. from triggering "red".
 
 How to calibrate (no keyboard shortcuts — everything is in the GUI)
 -------------------------------------------------------------------
-    python3 stoplight_detection.py traffic_light/
-    python3 stoplight_detection.py traffic_light/3.jpeg
+    python3 stoplight_detection.py testing_images/traffic_light/
+    python3 stoplight_detection.py testing_images/traffic_light/3.jpeg
 
     The window has a button bar across the top, a side-by-side image below
     (left = original + diagnostics, right = active filter only), and HSV
@@ -38,7 +38,7 @@ How to calibrate (no keyboard shortcuts — everything is in the GUI)
          at the top of this file.
 
     To verify on other images: re-run the script with a different path
-    (e.g. `... traffic_light/3.jpeg`).  No navigation buttons in the GUI.
+    (e.g. `... testing_images/traffic_light/3.jpeg`).  No navigation buttons in the GUI.
 
     Manual tuning:
       - Click [Red 1] / [Red 2] / [Green] to choose which interval the
@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -71,6 +72,13 @@ try:
 except ImportError:
     _ROS_AVAILABLE = False
     Node = object
+
+try:
+    import torch
+    from ultralytics import YOLO
+    _YOLO_AVAILABLE = True
+except ImportError:
+    _YOLO_AVAILABLE = False
 
 
 # ── Calibration values ────────────────────────────────────────────────────────
@@ -90,6 +98,32 @@ BLUR_KSIZE   = (5, 5)
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
+
+
+# ── YOLO sign overlay (mirrors final_challenge/sign_detector.py) ─────────────
+# Used to annotate the calibration GUI's LEFT panel with YOLO bounding boxes
+# for the same objects the SignDetectorNode publishes.  Strictly diagnostic —
+# the StoplightDetector ROS node never runs YOLO.
+YOLO_MODEL_NAME     = "yolo11n.pt"
+YOLO_CONF_THRESHOLD = 0.5
+YOLO_TARGET_CLASSES = {"parking_meter", "fire_hydrant", "bird", "traffic light"}
+YOLO_CLASS_COLORS = {
+    "parking_meter": (0, 255, 0),
+    "fire_hydrant":  (0, 0, 255),
+    "bird":          (255, 165, 0),
+    "traffic light": (255, 255, 0),
+}
+
+
+@dataclass(frozen=True)
+class YoloDetection:
+    class_id: int
+    class_name: str
+    confidence: float
+    x1: int
+    y1: int
+    x2: int
+    y2: int
 
 
 def default_ranges():
@@ -186,6 +220,44 @@ def detect_color(masks, min_area=MIN_AREA):
     if area < min_area:
         return None
     return color
+
+
+def _yolo_results_to_detections(model, result):
+    """Convert ultralytics Results.boxes into YoloDetection rows."""
+    detections = []
+    if result.boxes is None:
+        return detections
+
+    xyxy = result.boxes.xyxy
+    conf = result.boxes.conf
+    cls  = result.boxes.cls
+    xyxy_np = xyxy.detach().cpu().numpy() if hasattr(xyxy, "detach") else np.asarray(xyxy)
+    conf_np = conf.detach().cpu().numpy() if hasattr(conf, "detach") else np.asarray(conf)
+    cls_np  = cls.detach().cpu().numpy()  if hasattr(cls,  "detach") else np.asarray(cls)
+
+    for box, conf_val, cls_val in zip(xyxy_np, conf_np, cls_np):
+        detections.append(YoloDetection(
+            class_id=int(cls_val),
+            class_name=model.names[int(cls_val)],
+            confidence=float(conf_val),
+            x1=int(box[0]),
+            y1=int(box[1]),
+            x2=int(box[2]),
+            y2=int(box[3]),
+        ))
+    return detections
+
+
+def _draw_yolo_detections(bgr, detections):
+    """Draw every YoloDetection in `detections` onto `bgr` in place."""
+    for det in detections:
+        color = YOLO_CLASS_COLORS.get(det.class_name, (255, 255, 255))
+        cv2.rectangle(bgr, (det.x1, det.y1), (det.x2, det.y2), color, 2)
+        label = f"{det.class_name} {det.confidence:.2f}"
+        cv2.putText(bgr, label,
+                    (det.x1, max(12, det.y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    return bgr
 
 
 # ── ROS2 node ────────────────────────────────────────────────────────────────
@@ -430,6 +502,44 @@ def calibrate(paths):
         print("No loadable images.")
         return
 
+    yolo_model = None
+    yolo_allowed_cls = []
+    yolo_cache = {}
+    if _YOLO_AVAILABLE:
+        try:
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            yolo_model = YOLO(YOLO_MODEL_NAME)
+            yolo_model.to(device)
+            yolo_allowed_cls = [
+                i for i, name in yolo_model.names.items()
+                if name in YOLO_TARGET_CLASSES
+            ]
+            print(f"YOLO loaded on {device}. "
+                  f"Annotating: {sorted(YOLO_TARGET_CLASSES)}")
+        except Exception as e:
+            print(f"  YOLO failed to load: {e} — left panel skips YOLO overlay.")
+            yolo_model = None
+    else:
+        print("  ultralytics/torch not installed — "
+              "left panel skips YOLO overlay.")
+
+    def yolo_dets_for(path, img):
+        if yolo_model is None:
+            return []
+        if path in yolo_cache:
+            return yolo_cache[path]
+        try:
+            results = yolo_model(img, classes=yolo_allowed_cls,
+                                 conf=YOLO_CONF_THRESHOLD, verbose=False)
+        except Exception as e:
+            print(f"  YOLO inference failed on {path}: {e}")
+            yolo_cache[path] = []
+            return []
+        dets = (_yolo_results_to_detections(yolo_model, results[0])
+                if results else [])
+        yolo_cache[path] = dets
+        return dets
+
     state = {
         "active":   "red1",
         "ranges":   default_ranges(),
@@ -635,8 +745,9 @@ def calibrate(paths):
                     (10, 72),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
-        # ── Decorate the LEFT panel: original + ROI + active-filter label only.
+        # ── Decorate the LEFT panel: original + YOLO overlay + ROI + label.
         left = img.copy()
+        _draw_yolo_detections(left, yolo_dets_for(path, img))
         if state["roi"] is not None:
             x_r, y_r, w_r, h_r = state["roi"]
             cv2.rectangle(left, (x_r, y_r), (x_r + w_r, y_r + h_r),
