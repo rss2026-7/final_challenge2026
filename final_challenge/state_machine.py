@@ -74,6 +74,7 @@ class FinalChallengeStateMachine(Node):
         self.declare_parameter("park_duration",          5.0)   # seconds
         self.declare_parameter("return_to_start",        True)
         self.declare_parameter("planning_wait_secs",     1.0)   # wait after sending goal
+        self.declare_parameter("recovery_duration",      1.5)   # seconds to reverse after each stop
 
         self.odom_topic        = self.get_parameter("odom_topic").value
         self.drive_topic       = self.get_parameter("drive_topic").value
@@ -81,6 +82,7 @@ class FinalChallengeStateMachine(Node):
         self.park_duration     = self.get_parameter("park_duration").value
         self.return_to_start   = self.get_parameter("return_to_start").value
         self.planning_wait     = self.get_parameter("planning_wait_secs").value
+        self.recovery_duration = self.get_parameter("recovery_duration").value
 
         # ------------------------------------------------------------------ #
         #  Internal state                                                      #
@@ -436,7 +438,7 @@ class FinalChallengeStateMachine(Node):
         reconverge on familiar geometry before the next goal is issued.
         """
         elapsed = (self.get_clock().now() - self.recover_start_time).nanoseconds / 1e9
-        if elapsed < 1.5:
+        if elapsed < self.recovery_duration:
             cmd = AckermannDriveStamped()
             cmd.drive.speed = -0.5          # slow reverse
             cmd.drive.steering_angle = 0.0  # straight back
