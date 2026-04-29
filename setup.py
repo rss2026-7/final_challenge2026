@@ -23,12 +23,15 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'lane_detector           = final_challenge.lane_detector:main',
-            'boundary_pure_pursuit   = final_challenge.lane_follower:main',
-            'test_lane_publisher     = final_challenge.test_lane_publisher:main',
-            'state_machine           = final_challenge.state_machine:main',
+            'lane_detector            = final_challenge.lane_detector:main',
+            'boundary_pure_pursuit    = final_challenge.lane_follower:main',
+            'test_lane_publisher      = final_challenge.test_lane_publisher:main',
+            'state_machine            = final_challenge.state_machine:main',
             'basement_point_publisher = final_challenge.basement_point_publisher:main',
-            'homography_transformer  = final_challenge.homography_transformer:main',
+            'homography_transformer   = final_challenge.homography_transformer:main',
+            'sign_detector            = final_challenge.sign_detector:main',
+            'stoplight_detection      = final_challenge.stoplight_detection:main',
+            'yolo_node                = final_challenge.yolo_node:main',
         ],
     },
 )

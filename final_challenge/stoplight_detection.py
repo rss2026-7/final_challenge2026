@@ -66,7 +66,7 @@ try:
     import rclpy
     from rclpy.node import Node
     from cv_bridge import CvBridge
-    from sensor_msgs.msg import Image
+    from sensor_msgs.msg import Image, RegionOfInterest
     from std_msgs.msg import String
     _ROS_AVAILABLE = True
 except ImportError:
@@ -263,15 +263,23 @@ def _draw_yolo_detections(bgr, detections):
 # ── ROS2 node ────────────────────────────────────────────────────────────────
 class StoplightDetector(Node):
     """
+    Assumes yolo_node.py is running and publishing the traffic-light ROI.
+    Each frame is cropped to the latest traffic-light bbox before HSV
+    segmentation; if no valid bbox has arrived within `roi_timeout_sec`,
+    the node skips analysis and publishes "none".
+
     Subscriptions
     -------------
     /zed/zed_node/rgb/image_rect_color (sensor_msgs/Image) — overridable via
         the `image_topic` parameter.
+    /yolo/traffic_light/roi (sensor_msgs/RegionOfInterest) — overridable via
+        the `traffic_light_roi_topic` parameter.
 
     Publications
     ------------
     /stoplight/result      (std_msgs/String)    "red" | "green" | "none"
-    /stoplight/segmented   (sensor_msgs/Image)  debug — red+green pixels only
+    /stoplight/segmented   (sensor_msgs/Image)  debug — red+green pixels only,
+        zeroed outside the active ROI.
 
     HSV bounds and the min_area threshold are exposed as parameters so they
     can be tuned at launch time without editing the source.
@@ -284,6 +292,15 @@ class StoplightDetector(Node):
             self.declare_parameter("image_topic",
                                    "/zed/zed_node/rgb/image_rect_color")
             .get_parameter_value().string_value
+        )
+        self.roi_topic = (
+            self.declare_parameter("traffic_light_roi_topic",
+                                   "/yolo/traffic_light/roi")
+            .get_parameter_value().string_value
+        )
+        self.roi_timeout_sec = (
+            self.declare_parameter("roi_timeout_sec", 2.0)
+            .get_parameter_value().double_value
         )
 
         self.ranges = {
@@ -305,12 +322,18 @@ class StoplightDetector(Node):
 
         self.bridge = CvBridge()
 
+        self._latest_roi = None        # (x, y, w, h) — most recent valid bbox
+        self._latest_roi_stamp = None  # rclpy.time.Time when it arrived
+
         self.create_subscription(Image, self.image_topic, self._image_cb, 5)
+        self.create_subscription(
+            RegionOfInterest, self.roi_topic, self._roi_cb, 10)
         self.result_pub = self.create_publisher(String, "/stoplight/result",    10)
         self.seg_pub    = self.create_publisher(Image,  "/stoplight/segmented", 10)
 
         self.get_logger().info(
-            f"StoplightDetector ready — listening on {self.image_topic}, "
+            f"StoplightDetector ready — image={self.image_topic}, "
+            f"roi={self.roi_topic}, roi_timeout={self.roi_timeout_sec}s, "
             f"min_area={self.min_area}")
 
     def _declare_hsv(self, name, default):
@@ -325,6 +348,29 @@ class StoplightDetector(Node):
             return list(default)
         return val
 
+    def _roi_cb(self, msg: RegionOfInterest):
+        # yolo_node publishes width=0/height=0 for "no detection this frame";
+        # only treat non-empty boxes as a fresh bbox and reset the stale clock.
+        if msg.width == 0 or msg.height == 0:
+            return
+        self._latest_roi = (
+            int(msg.x_offset), int(msg.y_offset),
+            int(msg.width),    int(msg.height),
+        )
+        self._latest_roi_stamp = self.get_clock().now()
+        self.get_logger().info(
+            f"traffic_light bbox: x={msg.x_offset} y={msg.y_offset} "
+            f"w={msg.width} h={msg.height}")
+
+    def _current_roi(self):
+        """Return the latest bbox if it arrived within the timeout, else None."""
+        if self._latest_roi is None or self._latest_roi_stamp is None:
+            return None
+        elapsed = (self.get_clock().now() - self._latest_roi_stamp).nanoseconds / 1e9
+        if elapsed > self.roi_timeout_sec:
+            return None
+        return self._latest_roi
+
     def _image_cb(self, msg: Image):
         try:
             bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
@@ -332,12 +378,26 @@ class StoplightDetector(Node):
             self.get_logger().error(f"cv_bridge failed: {e}")
             return
 
-        masks, composite = segment_lights(bgr, self.ranges)
-
+        roi = self._current_roi()
         result_msg = String()
-        result_msg.data = detect_color(masks, self.min_area) or "none"
-        self.result_pub.publish(result_msg)
+        composite = np.zeros_like(bgr)
 
+        if roi is not None:
+            h_img, w_img = bgr.shape[:2]
+            x, y, w, h = roi
+            x = max(0, min(x, w_img - 1))
+            y = max(0, min(y, h_img - 1))
+            w = max(1, min(w, w_img - x))
+            h = max(1, min(h, h_img - y))
+            crop = bgr[y:y + h, x:x + w]
+
+            masks, crop_composite = segment_lights(crop, self.ranges)
+            composite[y:y + h, x:x + w] = crop_composite
+            result_msg.data = detect_color(masks, self.min_area) or "none"
+        else:
+            result_msg.data = "none"
+
+        self.result_pub.publish(result_msg)
         seg_msg = self.bridge.cv2_to_imgmsg(composite, encoding="bgr8")
         seg_msg.header = msg.header
         self.seg_pub.publish(seg_msg)
