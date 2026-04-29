@@ -48,6 +48,21 @@ ros2 run final_challenge state_machine --ros-args \
 ros2 run final_challenge sign_detector
 ```
 
+**Terminal 6 — homography transformer** *(required for parking)*
+```bash
+ros2 run final_challenge homography_transformer
+```
+Converts Weiming's pixel detections on `/relative_cone_px` → metres on `/relative_cone`.
+
+**Terminal 7 — parking controller** *(required for parking)*
+```bash
+ros2 run final_challenge parking_controller --ros-args \
+  -p drive_topic:=/drive
+```
+Waits idle until `/parking/trigger` fires, then servos toward `/relative_cone` and publishes `/parking/done`.
+
+> **Note:** Weiming's YOLO node must also be running to publish `/relative_cone_px`. Without it the parking controller will receive no cone location and sit still.
+
 ---
 
 ## Simulator — with particle filter (closer to real robot)
@@ -93,6 +108,21 @@ to be overridden from the real-robot default.
 ros2 run final_challenge sign_detector
 ```
 
+**Terminal 6 — homography transformer** *(required for parking)*
+```bash
+ros2 run final_challenge homography_transformer
+```
+Converts Weiming's pixel detections on `/relative_cone_px` → metres on `/relative_cone`.
+
+**Terminal 7 — parking controller** *(required for parking)*
+```bash
+ros2 run final_challenge parking_controller --ros-args \
+  -p drive_topic:=/drive
+```
+Waits idle until `/parking/trigger` fires, then servos toward `/relative_cone` and publishes `/parking/done`.
+
+> **Note:** Weiming's YOLO node must also be running to publish `/relative_cone_px`. Without it the parking controller will receive no cone location and sit still.
+
 ---
 
 ## Real Robot
@@ -130,6 +160,23 @@ ros2 run final_challenge state_machine
 ```bash
 ros2 run final_challenge sign_detector
 ```
+
+**Terminal 5 — homography transformer** *(required for parking)*
+```bash
+ros2 run final_challenge homography_transformer
+```
+Converts Weiming's pixel detections on `/relative_cone_px` → metres on `/relative_cone`.
+
+**Terminal 6 — parking controller** *(required for parking)*
+```bash
+ros2 run final_challenge parking_controller
+```
+Uses the real-robot drive topic (`/vesc/low_level/input/navigation`) by default.
+Waits idle until `/parking/trigger` fires, then servos toward `/relative_cone` and publishes `/parking/done`.
+Control data (distance, angle, speed, steering) is logged to a timestamped CSV in the working directory for post-run analysis.
+
+> **Note:** Weiming's YOLO node must also be running to publish `/relative_cone_px`. Without it the parking controller will receive no cone location and sit still.
+
 
 ---
 
