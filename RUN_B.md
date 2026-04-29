@@ -158,3 +158,12 @@ launch file becomes more valuable to start everything cleanly in one shot.
 | `/sign_detection/result` | sub | detected object class — "parking_meter", "fire_hydrant", or "bird" |
 | `/parking/trigger` | pub | [KEVIN] start parking controller |
 | `/parking/done` | sub | [KEVIN] parking complete signal |
+
+## YOLO Sign Detector (Traffic Light + Objects)
+
+### How to run
+
+Open a new terminal and run:
+
+```bash
+ros2 run final_challenge sign_detector
