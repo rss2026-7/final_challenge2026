@@ -9,15 +9,11 @@
 
        Run with:
          ros2 launch final_challenge lane_follow_sim.launch.xml
-         ros2 launch final_challenge lane_follow_sim.launch.xml camera:=true track_side:=right
+         ros2 launch final_challenge lane_follow_sim.launch.xml camera:=true
   -->
 
   <arg name="camera"        default="false"
        description="Set true to run lane_detector with a simulated camera topic"/>
-  <arg name="track_side"    default="left"
-       description="Which lane boundary to track: left or right"/>
-  <arg name="inward_offset" default="0.30"
-       description="Metres to drive inside the chosen boundary"/>
   <arg name="nominal_speed" default="2.0"
        description="Target speed on straights (m/s)"/>
   <arg name="drive_topic"   default="/drive"
@@ -36,12 +32,11 @@
   <node unless="$(var camera)"
         pkg="final_challenge" exec="test_lane_publisher" output="screen"/>
 
-  <!-- ── Control: pure-pursuit on the selected boundary ────────────── -->
+  <!-- ── Control: bilateral midpoint pure-pursuit ────────────────── -->
   <node pkg="final_challenge" exec="boundary_pure_pursuit" output="screen">
     <param name="drive_topic"         value="$(var drive_topic)"/>
-    <param name="track_side"          value="$(var track_side)"/>
-    <param name="inward_offset"       value="$(var inward_offset)"/>
     <param name="nominal_speed"       value="$(var nominal_speed)"/>
+    <param name="half_width_init"     value="0.5"/>
 
     <param name="lookahead_distance"           value="1.2"/>
     <param name="lost_line_lookahead_distance" value="0.9"/>

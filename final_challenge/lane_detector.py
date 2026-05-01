@@ -20,7 +20,38 @@ from final_challenge.homography_transformer import build_homography, transform_u
 
 # Tunable
 N_SAMPLES = 15   # points sampled per detected Hough line
-MIN_VOTES = 3    # discard Hough clusters with fewer accumulator votes
+MIN_VOTES = 5    # discard Hough clusters with fewer accumulator votes (filters noisy near-zero artifacts)
+MAX_ABS_Y = 1.5  # discard candidate lines whose median car-frame |y| exceeds this (outliers from
+                 # near-horizon homography projection)
+MIN_FORWARD_SPAN = 0.3  # path must span >= this many metres forward in car frame
+MAX_X_CAR        = 4.0  # cap forward distance per sample. The homography horizon is at
+                        # v ≈ 138 px and ROI top is at v ≈ 150 px, so samples near the
+                        # ROI top project to wildly large x_car. 4 m is well past the
+                        # 1.2 m lookahead and bounds away from the projective horizon.
+MAX_DY_OVER_DX = 0.4    # path must be roughly forward-aligned. Real boundaries on
+                        # straights have |slope| < 0.15; mild curves up to ~0.35;
+                        # transverse markers register at |slope| ≥ 0.48. 0.4 keeps
+                        # gentle curves and rejects transverse markers cleanly.
+
+
+def _path_is_plausible_boundary(pts):
+    """A car-frame path is a plausible lane boundary iff it spans enough
+    forward distance and is roughly forward-aligned (small lateral slope).
+    Filters out cross-track markers and short fragments. Uses a regression
+    slope rather than first-last delta so blob spines (jittery per-row means)
+    don't get rejected on noise."""
+    if len(pts) < 2:
+        return False
+    xs = np.array([p[0] for p in pts])
+    ys = np.array([p[1] for p in pts])
+    if xs[-1] - xs[0] < MIN_FORWARD_SPAN:
+        return False
+    if np.ptp(xs) < 1e-6:
+        return False
+    slope = np.polyfit(xs, ys, 1)[0]
+    if abs(slope) > MAX_DY_OVER_DX:
+        return False
+    return True
 
 
 def _make_path(points, stamp, frame_id="base_link"):
@@ -120,9 +151,12 @@ class LaneDetector(Node):
             if ll['votes'] < MIN_VOTES:
                 continue
             pts = self._hough_line_to_car_pts(ll, h, w, roi_top)
-            if len(pts) >= 2:
-                median_y = float(np.median([p[1] for p in pts]))
-                car_lines.append((median_y, ll, pts))
+            if not _path_is_plausible_boundary(pts):
+                continue
+            median_y = float(np.median([p[1] for p in pts]))
+            if abs(median_y) > MAX_ABS_Y:
+                continue
+            car_lines.append((median_y, ll, pts))
 
         if len(car_lines) >= 2:
             left_pts, right_pts = self._split_left_right(car_lines)
@@ -130,27 +164,40 @@ class LaneDetector(Node):
             return left_pts, right_pts, debug_lines
 
         # ── Fallback: blob detector (better on curves) ────────────────
-        self.get_logger().warn(
-            "Hough produced <2 valid lines — falling back to blob detector.",
-            throttle_duration_sec=1.0,
-        )
+        # Blob fallback is a normal mode of operation — many frames yield <2
+        # Hough lines after plausibility filtering. Only warn if BOTH fail.
         blob_spines = detect_white_lines(frame)
 
         car_lines = []
         for spine in blob_spines:
             pts = self._spine_to_car_pts(spine)
-            if len(pts) >= 2:
-                median_y = float(np.median([p[1] for p in pts]))
-                car_lines.append((median_y, None, pts))
+            if not _path_is_plausible_boundary(pts):
+                continue
+            median_y = float(np.median([p[1] for p in pts]))
+            if abs(median_y) > MAX_ABS_Y:
+                continue
+            car_lines.append((median_y, None, pts))
 
         if len(car_lines) >= 2:
             left_pts, right_pts = self._split_left_right(car_lines)
             return left_pts, right_pts, []
 
-        # Only one or zero lines — return whatever we have
-        all_pts = [pts for _, _, pts in car_lines]
-        left_pts  = all_pts[0] if len(all_pts) > 0 else []
-        right_pts = all_pts[1] if len(all_pts) > 1 else []
+        # Both detectors found <2 plausible lines — this is a real degraded frame.
+        self.get_logger().warn(
+            "Both Hough and blob produced <2 valid lines.",
+            throttle_duration_sec=1.0,
+        )
+
+        # Only one or zero lines — classify the single line by the sign of its
+        # median y so it lands on its true side. Blindly assigning to "left"
+        # would steer the car toward the wall when the detection is on the right.
+        left_pts, right_pts = [], []
+        if car_lines:
+            median_y, _, pts = car_lines[0]
+            if median_y >= 0:
+                left_pts = pts
+            else:
+                right_pts = pts
         return left_pts, right_pts, []
 
     # ------------------------------------------------------------------
@@ -159,33 +206,32 @@ class LaneDetector(Node):
     @staticmethod
     def _split_left_right(car_lines):
         """
-        Given a list of (median_y, ll, pts) sorted arbitrarily, find the pair
-        of lane boundaries that bracket y=0 (the car centreline).
+        Given a list of (median_y, ll, pts), find the pair of lane boundaries
+        that bracket y=0 (the car centreline).
 
         Left boundary  = line with y > 0 closest to y=0.
         Right boundary = line with y < 0 closest to y=0 (least negative).
 
-        If all detected lines are on one side (e.g. car near a boundary),
-        the two closest to y=0 are returned as left and right respectively.
+        If all detected lines are on one side, only that side is returned;
+        the other is left empty. The controller handles an empty path safely
+        via stale-path memory + stop_if_no_path. Labelling a same-side line
+        as the opposite boundary would feed the wrong path to the controller
+        and steer the car toward the wall.
         """
-        # Sort descending by median y: leftmost first
         sorted_lines = sorted(car_lines, key=lambda t: t[0], reverse=True)
 
         left_candidates  = [(m, pts) for m, _, pts in sorted_lines if m >= 0]
         right_candidates = [(m, pts) for m, _, pts in sorted_lines if m <  0]
 
         if left_candidates and right_candidates:
-            # Ideal case: lines on both sides.  Pick those closest to y=0.
             left_pts  = left_candidates[-1][1]   # smallest positive y
             right_pts = right_candidates[0][1]   # least-negative y
         elif left_candidates:
-            # All lines to the left; take the two closest to the car
             left_pts  = left_candidates[-1][1]
-            right_pts = left_candidates[-2][1] if len(left_candidates) >= 2 else []
+            right_pts = []
         else:
-            # All lines to the right; take the two closest to the car
             right_pts = right_candidates[0][1]
-            left_pts  = right_candidates[1][1] if len(right_candidates) >= 2 else []
+            left_pts  = []
 
         return left_pts, right_pts
 
@@ -193,26 +239,35 @@ class LaneDetector(Node):
     # Pixel → car-frame conversion helpers
     # ------------------------------------------------------------------
     def _hough_line_to_car_pts(self, ll, h, w, roi_top):
-        """Sample a Hough line model into car-frame (x, y) points, near-to-far."""
+        """Sample a Hough line model into car-frame (x, y) points, near-to-far.
+
+        Skip samples where the line exits the image (clipping x_px to [0, w-1]
+        would pile points at the edge and the homography turns that L-kink into
+        fake curvature). Skip samples that project past MAX_X_CAR (the projective
+        horizon makes far samples meaningless).
+        """
         m, b = ll['coeffs']
         pts  = []
         for y_px in np.linspace(h - 1, roi_top, N_SAMPLES):
-            x_px = float(np.clip(m * y_px + b, 0, w - 1))
-            x_car, y_car = transform_uv_to_xy(self.H, x_px, y_px)
-            if x_car > 0.0:
+            x_px = m * y_px + b
+            if x_px < 0 or x_px > w - 1:
+                continue
+            x_car, y_car = transform_uv_to_xy(self.H, float(x_px), float(y_px))
+            if 0.0 < x_car < MAX_X_CAR:
                 pts.append((x_car, y_car))
         pts.sort(key=lambda p: p[0])
         return pts
 
     def _spine_to_car_pts(self, spine):
-        """
-        Convert a blob spine (list of image-space (x, y) points, bottom-to-top)
-        into car-frame (x, y) points, near-to-far.
+        """Convert a blob spine to car-frame points, near-to-far.
+
+        Cap x_car at MAX_X_CAR for the same reason as Hough: rows near the
+        ROI top project past the homography horizon and produce noise.
         """
         pts = []
         for u, v in spine:
             x_car, y_car = transform_uv_to_xy(self.H, float(u), float(v))
-            if x_car > 0.0:
+            if 0.0 < x_car < MAX_X_CAR:
                 pts.append((x_car, y_car))
         pts.sort(key=lambda p: p[0])
         return pts

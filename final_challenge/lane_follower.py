@@ -28,28 +28,113 @@ def path_arc_length(points: List[Tuple[float, float]]) -> float:
     return length
 
 
+def interp_y_at_x(path: List[Tuple[float, float]], x: float) -> Optional[float]:
+    """Linear interpolation: given a near-to-far x-sorted path, return y at given x.
+    Returns None if x is outside the path's x-range (no extrapolation)."""
+    if len(path) < 2 or x < path[0][0] or x > path[-1][0]:
+        return None
+    for i in range(1, len(path)):
+        if path[i][0] >= x:
+            x0, y0 = path[i - 1]
+            x1, y1 = path[i]
+            if x1 == x0:
+                return y0
+            t = (x - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return path[-1][1]
+
+
+def build_midpoint_path(
+    left: List[Tuple[float, float]],
+    right: List[Tuple[float, float]],
+) -> List[Tuple[float, float]]:
+    """Build a midpoint polyline between left and right boundary paths.
+    Sample at common x-range of both, step ~0.2m."""
+    if len(left) < 2 or len(right) < 2:
+        return []
+    x_start = max(left[0][0], right[0][0])
+    x_end = min(left[-1][0], right[-1][0])
+    if x_end - x_start < 0.2:
+        return []
+
+    midpts = []
+    x = x_start
+    step = 0.2
+    while x <= x_end + 1e-6:
+        yl = interp_y_at_x(left, x)
+        yr = interp_y_at_x(right, x)
+        if yl is not None and yr is not None:
+            midpts.append((x, 0.5 * (yl + yr)))
+        x += step
+    return midpts
+
+
+def offset_path_y(
+    path: List[Tuple[float, float]],
+    dy: float,
+) -> List[Tuple[float, float]]:
+    """Shift each point of `path` by dy in the y direction.
+
+    Plausibility filter accepts only forward-aligned paths (|slope| < 0.4),
+    so a pure y-shift is within ~6% of the true normal-shift. Per-point local
+    normals computed from blob spines are jittery; y-shift is deterministic
+    and produces a stable target.
+    """
+    if len(path) < 1 or abs(dy) < 1e-6:
+        return list(path)
+    return [(x, y + dy) for (x, y) in path]
+
+
+def fit_target_at_forward(
+    path: List[Tuple[float, float]],
+    forward_distance: float,
+) -> Optional[Tuple[float, float]]:
+    """Fit a line to the path's (x, y) and evaluate at x = forward_distance.
+
+    Used instead of walking-along-arc so that noisy 200-point blob spines
+    produce the same target as 14-point Hough samples for the same physical
+    line. Removes the dominant source of frame-to-frame target jitter.
+    """
+    if len(path) < 2:
+        return None
+    import numpy as np  # local import to keep module dep tidy
+    xs = np.array([p[0] for p in path])
+    ys = np.array([p[1] for p in path])
+    if float(np.ptp(xs)) < 0.05:
+        return None
+    slope, intercept = np.polyfit(xs, ys, 1)
+    return (float(forward_distance),
+            float(slope * forward_distance + intercept))
+
+
 class BoundaryPurePursuit(Node):
     """
-    Pure pursuit controller that follows either the left or right lane boundary
-    with an inward offset.
+    Pure pursuit controller that drives the lane center.
 
-    Features:
-    - choose left or right boundary
-    - follow last known valid path when line is temporarily lost
-    - slow down when using stale path
-    - stop if stale for too long
-    - curvature-adaptive lookahead
-    - steering low-pass filter
-    - RViz lookahead marker for debugging
-    - dynamic parameter reconfiguration
+    Strategy
+    --------
+    BILATERAL — when both /left_lane_line and /right_lane_line are fresh:
+        target path = midpoint of the two boundaries (per-x average).
+        No offset, no track-side preference. The geometric center IS the goal.
+        Also updates a learned half-lane-width estimate.
 
-    Assumptions:
-    - Upstream publishes:
-        /left_lane_line  (nav_msgs/Path)
-        /right_lane_line (nav_msgs/Path)
-    - Points are in base_link frame
-    - x forward, y left
-    - path is ordered from near to far
+    LEFT_ONLY / RIGHT_ONLY — when only one boundary is fresh:
+        target path = visible boundary shifted inward by the learned half-width
+        (along local normal). Sign is determined by which side is missing.
+
+    STALE — when neither side is fresh:
+        follow the last good midpoint path for up to stale_path_timeout seconds.
+        After that, stop.
+
+    Subscriptions
+    -------------
+    /left_lane_line  (nav_msgs/Path) — left boundary in base_link
+    /right_lane_line (nav_msgs/Path) — right boundary in base_link
+
+    Publications
+    ------------
+    /drive            (ackermann_msgs/AckermannDriveStamped)
+    /lookahead_target (visualization_msgs/Marker)
     """
 
     def __init__(self) -> None:
@@ -61,8 +146,6 @@ class BoundaryPurePursuit(Node):
         self.declare_parameter("left_line_topic", "/left_lane_line")
         self.declare_parameter("right_line_topic", "/right_lane_line")
         self.declare_parameter("drive_topic", "/drive")
-
-        self.declare_parameter("track_side", "left")  # "left" or "right"
 
         self.declare_parameter("wheelbase", 0.33)
         self.declare_parameter("lookahead_distance", 1.2)
@@ -78,33 +161,34 @@ class BoundaryPurePursuit(Node):
         self.declare_parameter("curvature_speed_gain", 1.2)
         self.declare_parameter("curvature_lookahead_gain", 2.0)
 
-        # Distance inward from chosen boundary.
-        # Example: 0.20 means drive 20 cm inside the boundary.
-        self.declare_parameter("inward_offset", 0.20)
+        # Initial half-lane-width before any bilateral observation. EMA-updated at runtime.
+        self.declare_parameter("half_width_init", 0.5)
+        # EMA learning rate for half-width
+        self.declare_parameter("half_width_alpha", 0.1)
+        # Plausibility window for the lane half-width. BILATERAL is accepted only when
+        # the measured width sits in [2*half_width_min, 2*half_width_max].
+        self.declare_parameter("half_width_min", 0.35)
+        self.declare_parameter("half_width_max", 0.65)
 
-        # How long we trust old path after losing fresh detections
+        # How long we trust old midpoint after losing fresh detections
         self.declare_parameter("stale_path_timeout", 0.75)
-
         # How old a "latest" message can be before we consider it stale (seconds)
         self.declare_parameter("fresh_msg_timeout", 0.2)
-
-        # Minimum arc length of a path to be considered useful (meters)
+        # Minimum arc length of a single boundary path to be useful (meters)
         self.declare_parameter("min_path_arc_length", 0.3)
-
-        # If no valid line/path available, stop
+        # If no valid path available, stop
         self.declare_parameter("stop_if_no_path", True)
-
         # Steering smoothing factor (0 = no smoothing, 1 = instant)
-        self.declare_parameter("steering_alpha", 0.35)
+        self.declare_parameter("steering_alpha", 0.15)
+        # Target low-pass filter factor. Smooths mode-switch jumps and
+        # frame-to-frame jitter on the lookahead point. Smaller = more damping.
+        self.declare_parameter("target_alpha", 0.20)
 
         left_line_topic = self.get_parameter("left_line_topic").value
         right_line_topic = self.get_parameter("right_line_topic").value
         drive_topic = self.get_parameter("drive_topic").value
 
         self._load_tunable_params()
-
-        if self.track_side not in ("left", "right"):
-            raise ValueError("track_side must be 'left' or 'right'")
 
         # Subscriptions
         self.left_sub = self.create_subscription(
@@ -117,42 +201,43 @@ class BoundaryPurePursuit(Node):
         self.drive_pub = self.create_publisher(
             AckermannDriveStamped, drive_topic, 10
         )
-
-        # RViz marker for the lookahead target
         self.marker_pub = self.create_publisher(
             Marker, "/lookahead_target", 10
         )
 
-        # Store latest fresh paths separately, with timestamps
+        # Latest fresh boundary paths
         self.latest_left_path: List[Tuple[float, float]] = []
         self.latest_right_path: List[Tuple[float, float]] = []
         self.latest_left_path_time = None
         self.latest_right_path_time = None
 
-        # Last good path for the chosen side
-        self.last_good_path: List[Tuple[float, float]] = []
-        self.last_good_path_time = None
+        # Last good midpoint path (used during STALE)
+        self.last_good_midpoint: List[Tuple[float, float]] = []
+        self.last_good_midpoint_time = None
+
+        # Learned half-width (EMA)
+        self.half_width = self.half_width_init
 
         # Steering low-pass filter state
         self.prev_steering = 0.0
+        # Target low-pass filter state (smooths mode-switch jumps:
+        # BILATERAL→LEFT_ONLY can shift target ~half-width laterally)
+        self.prev_target: Optional[Tuple[float, float]] = None
 
-        # Timer to run control continuously even if detections momentarily stop
-        self.control_timer = self.create_timer(0.05, self.control_loop)  # 20 Hz
+        # 20 Hz control loop
+        self.control_timer = self.create_timer(0.05, self.control_loop)
 
-        # Dynamic parameter reconfiguration
         self.add_on_set_parameters_callback(self._on_param_change)
 
         self.get_logger().info(
-            f"BoundaryPurePursuit started. Tracking {self.track_side} boundary."
+            "BoundaryPurePursuit (bilateral midpoint mode) started. "
+            f"half_width_init={self.half_width_init:.2f}"
         )
 
     # -------------------------------------------------
     # Parameter helpers
     # -------------------------------------------------
     def _load_tunable_params(self) -> None:
-        """Read all tunable parameters from the parameter server."""
-        self.track_side = str(self.get_parameter("track_side").value).strip().lower()
-
         self.wheelbase = float(self.get_parameter("wheelbase").value)
         self.lookahead_distance = float(self.get_parameter("lookahead_distance").value)
         self.lost_line_lookahead_distance = float(
@@ -173,36 +258,33 @@ class BoundaryPurePursuit(Node):
             self.get_parameter("curvature_lookahead_gain").value
         )
 
-        self.inward_offset = float(self.get_parameter("inward_offset").value)
+        self.half_width_init = float(self.get_parameter("half_width_init").value)
+        self.half_width_alpha = float(self.get_parameter("half_width_alpha").value)
+        self.half_width_min = float(self.get_parameter("half_width_min").value)
+        self.half_width_max = float(self.get_parameter("half_width_max").value)
+
         self.stale_path_timeout = float(self.get_parameter("stale_path_timeout").value)
         self.fresh_msg_timeout = float(self.get_parameter("fresh_msg_timeout").value)
         self.min_path_arc_length = float(self.get_parameter("min_path_arc_length").value)
         self.stop_if_no_path = bool(self.get_parameter("stop_if_no_path").value)
         self.steering_alpha = float(self.get_parameter("steering_alpha").value)
+        self.target_alpha = float(self.get_parameter("target_alpha").value)
 
     def _on_param_change(self, params) -> SetParametersResult:
-        """Handle live parameter changes via `ros2 param set`."""
-        # Map of parameter names to attributes
         float_params = {
             "wheelbase", "lookahead_distance", "lost_line_lookahead_distance",
             "min_lookahead_distance", "nominal_speed", "lost_line_speed",
             "min_speed", "max_speed", "max_steering_angle",
             "curvature_speed_gain", "curvature_lookahead_gain",
-            "inward_offset", "stale_path_timeout", "fresh_msg_timeout",
-            "min_path_arc_length", "steering_alpha",
+            "half_width_init", "half_width_alpha",
+            "half_width_min", "half_width_max",
+            "stale_path_timeout", "fresh_msg_timeout",
+            "min_path_arc_length", "steering_alpha", "target_alpha",
         }
         for p in params:
             if p.name in float_params:
                 setattr(self, p.name, float(p.value))
                 self.get_logger().info(f"Parameter {p.name} updated to {p.value}")
-            elif p.name == "track_side":
-                val = str(p.value).strip().lower()
-                if val not in ("left", "right"):
-                    return SetParametersResult(
-                        successful=False, reason="track_side must be 'left' or 'right'"
-                    )
-                self.track_side = val
-                self.get_logger().info(f"Parameter track_side updated to {val}")
             elif p.name == "stop_if_no_path":
                 self.stop_if_no_path = bool(p.value)
                 self.get_logger().info(f"Parameter stop_if_no_path updated to {p.value}")
@@ -212,58 +294,164 @@ class BoundaryPurePursuit(Node):
     # Callbacks — only store data and timestamp
     # -------------------------------------------------
     def left_line_callback(self, msg: Path) -> None:
-        points = self.extract_valid_points(msg)
-        self.latest_left_path = points
+        self.latest_left_path = self.extract_valid_points(msg)
         self.latest_left_path_time = self.get_clock().now()
 
     def right_line_callback(self, msg: Path) -> None:
-        points = self.extract_valid_points(msg)
-        self.latest_right_path = points
+        self.latest_right_path = self.extract_valid_points(msg)
         self.latest_right_path_time = self.get_clock().now()
+
+    def extract_valid_points(self, msg: Path) -> List[Tuple[float, float]]:
+        points: List[Tuple[float, float]] = []
+        for pose_stamped in msg.poses:
+            x = pose_stamped.pose.position.x
+            y = pose_stamped.pose.position.y
+            if not math.isfinite(x) or not math.isfinite(y):
+                continue
+            if x < -0.2:
+                continue
+            points.append((x, y))
+        points.sort(key=lambda p: p[0])
+        return points
+
+    # -------------------------------------------------
+    # Freshness check on a single side
+    # -------------------------------------------------
+    def _fresh_path(self, side: str) -> Optional[List[Tuple[float, float]]]:
+        if side == "left":
+            path = self.latest_left_path
+            ts = self.latest_left_path_time
+        else:
+            path = self.latest_right_path
+            ts = self.latest_right_path_time
+
+        if ts is None:
+            return None
+        age = (self.get_clock().now() - ts).nanoseconds * 1e-9
+        if age > self.fresh_msg_timeout:
+            return None
+        if len(path) < 2 or path_arc_length(path) < self.min_path_arc_length:
+            return None
+        return path
 
     # -------------------------------------------------
     # Main control loop
     # -------------------------------------------------
     def control_loop(self) -> None:
-        fresh_path = self._get_selected_fresh_path()
+        L = self._fresh_path("left")
+        R = self._fresh_path("right")
 
-        using_stale_path = False
         path_to_follow: Optional[List[Tuple[float, float]]] = None
+        mode = "NONE"
+        is_stale = False
 
-        if fresh_path is not None and len(fresh_path) >= 2:
-            path_to_follow = fresh_path
-            # Update last good path (single canonical location)
-            self.last_good_path = fresh_path
-            self.last_good_path_time = self.get_clock().now()
-        else:
-            # Fall back to last good path if still recent enough
-            if len(self.last_good_path) >= 2 and self.last_good_path_time is not None:
-                age = (self.get_clock().now() - self.last_good_path_time).nanoseconds * 1e-9
+        # ── Priority 1: BILATERAL with plausible lane width ─────────────
+        if L is not None and R is not None:
+            mid = build_midpoint_path(L, R)
+            width = self._mean_width(L, R)
+            if (len(mid) >= 2
+                    and 2.0 * self.half_width_min <= width
+                    <= 2.0 * self.half_width_max):
+                path_to_follow = mid
+                mode = "BILATERAL"
+                self._update_half_width(L, R)
+                self.last_good_midpoint = mid
+                self.last_good_midpoint_time = self.get_clock().now()
+            else:
+                # Width implausible — drop the side whose median |y| is larger.
+                # The remaining side is usually the real adjacent boundary;
+                # the dropped side is most likely a far stripe or an artifact.
+                # Median (not min) is robust to sloped lines where one endpoint
+                # passes through y=0.
+                import numpy as np
+                l_med = abs(float(np.median([p[1] for p in L])))
+                r_med = abs(float(np.median([p[1] for p in R])))
+                if l_med <= r_med:
+                    R = None
+                else:
+                    L = None
+
+        # Hysteresis: if a fresh bilateral midpoint exists in the very
+        # recent past, keep using it instead of dropping to a single-side
+        # offset path. This eats the BILATERAL ↔ LEFT_ONLY oscillation that
+        # happens when a frame loses one boundary momentarily.
+        bilateral_hold_window = 0.3  # seconds
+        if (path_to_follow is None
+                and len(self.last_good_midpoint) >= 2
+                and self.last_good_midpoint_time is not None):
+            age = (self.get_clock().now()
+                   - self.last_good_midpoint_time).nanoseconds * 1e-9
+            if age <= bilateral_hold_window and (L is not None or R is not None):
+                path_to_follow = self.last_good_midpoint
+                mode = "BILATERAL_HOLD"
+
+        if path_to_follow is None and L is not None:
+            offset = offset_path_y(L, -self.half_width)
+            if len(offset) >= 2:
+                path_to_follow = offset
+                mode = "LEFT_ONLY"
+                self.last_good_midpoint = offset
+                self.last_good_midpoint_time = self.get_clock().now()
+
+        if path_to_follow is None and R is not None:
+            offset = offset_path_y(R, +self.half_width)
+            if len(offset) >= 2:
+                path_to_follow = offset
+                mode = "RIGHT_ONLY"
+                self.last_good_midpoint = offset
+                self.last_good_midpoint_time = self.get_clock().now()
+
+        if path_to_follow is None:
+            if (len(self.last_good_midpoint) >= 2
+                    and self.last_good_midpoint_time is not None):
+                age = (self.get_clock().now()
+                       - self.last_good_midpoint_time).nanoseconds * 1e-9
                 if age <= self.stale_path_timeout:
-                    path_to_follow = self.last_good_path
-                    using_stale_path = True
+                    path_to_follow = self.last_good_midpoint
+                    mode = "STALE"
+                    is_stale = True
 
         if path_to_follow is None:
             if self.stop_if_no_path:
                 self.publish_stop()
-            self.get_logger().info("No usable path — stopped.", throttle_duration_sec=1.0)
+            self.get_logger().info("No usable path — stopped.",
+                                   throttle_duration_sec=1.0)
             return
 
-        # Use previous curvature estimate for adaptive lookahead
-        lookahead = self._compute_adaptive_lookahead(
-            path_to_follow, is_stale=using_stale_path
-        )
+        # Curvature-adaptive lookahead is only trustworthy on the bilateral
+        # midpoint path. Single-side offsets are noisy enough that the 3-point
+        # Menger curvature estimate spikes (we've seen κ=3.3 on a real frame),
+        # which then floors the lookahead and doubles the steering gain.
+        if mode == "BILATERAL" and not is_stale:
+            lookahead = self._compute_adaptive_lookahead(path_to_follow, False)
+        elif is_stale:
+            lookahead = self.lost_line_lookahead_distance
+        else:
+            lookahead = self.lookahead_distance
 
-        target = self.find_lookahead_target(path_to_follow, lookahead)
+        # Polyfit-based target. Replaces walk-along-arc which is sensitive to
+        # detector switching (Hough vs. blob) — same physical line gives the
+        # same fitted target whether the path has 14 sample points or 200.
+        target = fit_target_at_forward(path_to_follow, lookahead)
+        if target is None:
+            target = self.find_lookahead_target(path_to_follow, lookahead)
         if target is None:
             if self.stop_if_no_path:
                 self.publish_stop()
             return
 
-        target = self.apply_inward_offset(path_to_follow, target)
+        # Low-pass the target so mode switches and per-frame jitter don't
+        # whip the steering. Reset the filter on stale recoveries to avoid
+        # carrying old state across long blackouts.
+        if self.prev_target is not None and not is_stale:
+            a = self.target_alpha
+            target = (
+                a * target[0] + (1.0 - a) * self.prev_target[0],
+                a * target[1] + (1.0 - a) * self.prev_target[1],
+            )
+        self.prev_target = target
 
-        # Publish RViz marker for debugging
-        self._publish_target_marker(target)
+        self._publish_target_marker(target, mode)
 
         steering_angle, curvature = self.compute_pure_pursuit_command(target)
 
@@ -274,69 +462,54 @@ class BoundaryPurePursuit(Node):
         )
         self.prev_steering = steering_angle
 
-        if using_stale_path:
+        if is_stale:
             speed = self.lost_line_speed
         else:
             speed = self.compute_speed_from_curvature(curvature, steering_angle)
 
         self.publish_drive(speed, steering_angle)
 
-        # Diagnostic logging (throttled)
         self.get_logger().info(
-            f"steer={steering_angle:.3f}  speed={speed:.2f}  "
-            f"stale={using_stale_path}  pts={len(path_to_follow)}  "
-            f"la={lookahead:.2f}  curv={curvature:.3f}",
+            f"mode={mode} steer={steering_angle:.3f} speed={speed:.2f} "
+            f"hw={self.half_width:.2f} pts={len(path_to_follow)} "
+            f"la={lookahead:.2f} curv={curvature:.3f}",
             throttle_duration_sec=0.5,
         )
 
     # -------------------------------------------------
-    # Path selection — with freshness checking
+    # Half-width learning
     # -------------------------------------------------
-    def _get_selected_fresh_path(self) -> Optional[List[Tuple[float, float]]]:
-        """Return the selected side's path only if the message is fresh enough
-        and the path has sufficient arc length."""
-        now = self.get_clock().now()
+    @staticmethod
+    def _mean_width(
+        left: List[Tuple[float, float]],
+        right: List[Tuple[float, float]],
+    ) -> float:
+        """|median_y_left - median_y_right|. Robust summary of the lateral gap.
 
-        if self.track_side == "left":
-            path = self.latest_left_path
-            ts = self.latest_left_path_time
-        else:
-            path = self.latest_right_path
-            ts = self.latest_right_path_time
+        Using medians rather than per-x interpolation keeps the width estimate
+        stable when the two paths span different forward ranges or when one
+        path has a few outlier points near a clipped edge.
+        """
+        if len(left) < 2 or len(right) < 2:
+            return 0.0
+        import numpy as np  # local — avoid module-level dep
+        yl = float(np.median([p[1] for p in left]))
+        yr = float(np.median([p[1] for p in right]))
+        return abs(yl - yr)
 
-        # No message received yet
-        if ts is None:
-            return None
-
-        age = (now - ts).nanoseconds * 1e-9
-        if age > self.fresh_msg_timeout:
-            return None
-
-        # Minimum arc length check
-        if len(path) < 2 or path_arc_length(path) < self.min_path_arc_length:
-            return None
-
-        return path
-
-    def extract_valid_points(self, msg: Path) -> List[Tuple[float, float]]:
-        points: List[Tuple[float, float]] = []
-
-        for pose_stamped in msg.poses:
-            x = pose_stamped.pose.position.x
-            y = pose_stamped.pose.position.y
-
-            if not math.isfinite(x) or not math.isfinite(y):
-                continue
-
-            # Mostly ignore points significantly behind the vehicle
-            if x < -0.2:
-                continue
-
-            points.append((x, y))
-
-        # Ensure near-to-far ordering
-        points.sort(key=lambda p: p[0])
-        return points
+    def _update_half_width(
+        self,
+        left: List[Tuple[float, float]],
+        right: List[Tuple[float, float]],
+    ) -> None:
+        w = self._mean_width(left, right)
+        if w <= 0.0:
+            return
+        half = 0.5 * w
+        # half_width_min/max are also the BILATERAL acceptance bounds, so any
+        # accepted bilateral pair already lies in this range.
+        a = self.half_width_alpha
+        self.half_width = (1.0 - a) * self.half_width + a * half
 
     # -------------------------------------------------
     # Adaptive lookahead
@@ -346,14 +519,10 @@ class BoundaryPurePursuit(Node):
         points: List[Tuple[float, float]],
         is_stale: bool,
     ) -> float:
-        """Scale lookahead inversely with path curvature.
-        On tight turns use a shorter lookahead; on straights use the full value."""
         if is_stale:
             return self.lost_line_lookahead_distance
 
-        # Estimate curvature from the first few segments of the path
         curvature_est = self._estimate_path_curvature(points)
-
         adaptive = self.lookahead_distance / (
             1.0 + self.curvature_lookahead_gain * curvature_est
         )
@@ -361,13 +530,17 @@ class BoundaryPurePursuit(Node):
 
     @staticmethod
     def _estimate_path_curvature(points: List[Tuple[float, float]]) -> float:
-        """Estimate average unsigned curvature from consecutive triplets."""
+        """Mean unsigned Menger curvature over consecutive triplets.
+
+        Each triplet's κ is clamped to 1.0 (1/m, R≥1m) before averaging so
+        that a single noisy point can't drive the average to bogus values
+        like 3.3 (R=0.3m), which would floor the adaptive lookahead.
+        """
         if len(points) < 3:
             return 0.0
 
         total_curvature = 0.0
         count = 0
-        # Sample up to 10 evenly spaced triplets
         step = max(1, (len(points) - 2) // 10)
         for i in range(0, len(points) - 2, step):
             p0 = points[i]
@@ -382,15 +555,12 @@ class BoundaryPurePursuit(Node):
             cross = abs(ax * by - ay * bx)
             la = math.hypot(ax, ay)
             lb = math.hypot(bx, by)
-            denom = la * lb
+            chord = math.hypot(p2[0] - p0[0], p2[1] - p0[1])
+            denom = la * lb * chord
             if denom < 1e-9:
                 continue
-
-            # Approximate curvature ≈ |cross| / (avg_segment_length * segment_length)
-            avg_seg = (la + lb) / 2.0
-            if avg_seg < 1e-9:
-                continue
-            total_curvature += cross / (denom * avg_seg) * 2.0
+            kappa = 2.0 * cross / denom
+            total_curvature += min(kappa, 1.0)
             count += 1
 
         return total_curvature / count if count > 0 else 0.0
@@ -401,13 +571,11 @@ class BoundaryPurePursuit(Node):
     def find_closest_point_index(self, points: List[Tuple[float, float]]) -> int:
         min_idx = 0
         min_dist = float("inf")
-
         for i, (x, y) in enumerate(points):
             d = math.hypot(x, y)
             if d < min_dist:
                 min_dist = d
                 min_idx = i
-
         return min_idx
 
     def find_lookahead_target(
@@ -421,7 +589,6 @@ class BoundaryPurePursuit(Node):
         closest_idx = self.find_closest_point_index(points)
 
         if closest_idx >= len(points) - 1:
-            # Closest point is the last point; extrapolate along the final segment
             return self._extrapolate_from_end(points, lookahead_distance)
 
         accumulated = 0.0
@@ -435,7 +602,6 @@ class BoundaryPurePursuit(Node):
                 remaining = lookahead_distance - accumulated
                 if seg_len < 1e-6:
                     return p_curr
-
                 t = remaining / seg_len
                 x = p_prev[0] + t * (p_curr[0] - p_prev[0])
                 y = p_prev[1] + t * (p_curr[1] - p_prev[1])
@@ -444,7 +610,6 @@ class BoundaryPurePursuit(Node):
             accumulated += seg_len
             p_prev = p_curr
 
-        # Path was too short — extrapolate beyond the last point
         remaining = lookahead_distance - accumulated
         return self._extrapolate_from_end(points, remaining)
 
@@ -453,77 +618,16 @@ class BoundaryPurePursuit(Node):
         points: List[Tuple[float, float]],
         distance: float,
     ) -> Tuple[float, float]:
-        """Extrapolate beyond the last path point along the final segment direction."""
         if len(points) < 2:
             return points[-1]
-
         dx = points[-1][0] - points[-2][0]
         dy = points[-1][1] - points[-2][1]
         seg_len = math.hypot(dx, dy)
-
         if seg_len < 1e-6:
             return points[-1]
-
         ux = dx / seg_len
         uy = dy / seg_len
         return (points[-1][0] + distance * ux, points[-1][1] + distance * uy)
-
-    # -------------------------------------------------
-    # Offset logic
-    # -------------------------------------------------
-    def apply_inward_offset(
-        self,
-        points: List[Tuple[float, float]],
-        target: Tuple[float, float]
-    ) -> Tuple[float, float]:
-        """
-        Shift the target inward from the selected boundary.
-
-        base_link convention:
-        - x forward
-        - y left
-
-        Inward offset direction:
-        - tracking left boundary  -> shift right  -> negative normal direction
-        - tracking right boundary -> shift left   -> positive normal direction
-        """
-        if len(points) < 2 or self.inward_offset <= 1e-6:
-            return target
-
-        nearest_idx = 0
-        nearest_dist = float("inf")
-        for i, p in enumerate(points):
-            d = point_dist(p, target)
-            if d < nearest_dist:
-                nearest_dist = d
-                nearest_idx = i
-
-        i0 = max(0, nearest_idx - 1)
-        i1 = min(len(points) - 1, nearest_idx + 1)
-
-        p0 = points[i0]
-        p1 = points[i1]
-
-        dx = p1[0] - p0[0]
-        dy = p1[1] - p0[1]
-        norm = math.hypot(dx, dy)
-        if norm < 1e-6:
-            return target
-
-        # Unit normal pointing left of tangent
-        nx = -dy / norm
-        ny = dx / norm
-
-        # Choose sign so offset is inward
-        if self.track_side == "left":
-            signed_offset = -self.inward_offset
-        else:  # right boundary
-            signed_offset = +self.inward_offset
-
-        return (
-            target[0] + signed_offset * nx,
-            target[1] + signed_offset * ny
-        )
 
     # -------------------------------------------------
     # Pure pursuit math
@@ -533,7 +637,6 @@ class BoundaryPurePursuit(Node):
         target: Tuple[float, float]
     ) -> Tuple[float, float]:
         tx, ty = target
-
         ld = math.hypot(tx, ty)
         ld = max(ld, 1e-3)
 
@@ -542,24 +645,16 @@ class BoundaryPurePursuit(Node):
 
         steering_angle = math.atan(self.wheelbase * curvature)
         steering_angle = clamp(
-            steering_angle,
-            -self.max_steering_angle,
-            self.max_steering_angle
+            steering_angle, -self.max_steering_angle, self.max_steering_angle
         )
-
         return steering_angle, abs(curvature)
 
     def compute_speed_from_curvature(
         self, curvature: float, steering_angle: float
     ) -> float:
-        """Speed that accounts for both curvature and steering angle magnitude."""
-        # Primary: slow down with curvature
         speed = self.nominal_speed / (1.0 + self.curvature_speed_gain * curvature)
-
-        # Secondary: further reduce if steering angle is large relative to max
-        steer_ratio = abs(steering_angle) / self.max_steering_angle  # 0..1
-        speed *= (1.0 - 0.3 * steer_ratio)  # up to 30 % additional reduction
-
+        steer_ratio = abs(steering_angle) / self.max_steering_angle
+        speed *= (1.0 - 0.3 * steer_ratio)
         return clamp(speed, self.min_speed, self.max_speed)
 
     # -------------------------------------------------
@@ -569,24 +664,19 @@ class BoundaryPurePursuit(Node):
         msg = AckermannDriveStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "base_link"
-
         msg.drive.speed = float(speed)
         msg.drive.steering_angle = float(steering_angle)
-
         self.drive_pub.publish(msg)
 
     def publish_stop(self) -> None:
         msg = AckermannDriveStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "base_link"
-
         msg.drive.speed = 0.0
         msg.drive.steering_angle = 0.0
-
         self.drive_pub.publish(msg)
 
-    def _publish_target_marker(self, target: Tuple[float, float]) -> None:
-        """Publish a sphere marker at the offset lookahead target for RViz."""
+    def _publish_target_marker(self, target: Tuple[float, float], mode: str) -> None:
         m = Marker()
         m.header.frame_id = "base_link"
         m.header.stamp = self.get_clock().now().to_msg()
@@ -604,15 +694,17 @@ class BoundaryPurePursuit(Node):
         m.scale.y = 0.10
         m.scale.z = 0.10
 
-        # Bright green when fresh, yellow when stale (marker color set in caller
-        # would add complexity; keep it simple green for now)
-        m.color.r = 0.0
-        m.color.g = 1.0
-        m.color.b = 0.0
+        # green=BILATERAL, yellow=single-side, red=stale
+        if mode == "BILATERAL":
+            m.color.r, m.color.g, m.color.b = 0.0, 1.0, 0.0
+        elif mode == "STALE":
+            m.color.r, m.color.g, m.color.b = 1.0, 0.0, 0.0
+        else:
+            m.color.r, m.color.g, m.color.b = 1.0, 1.0, 0.0
         m.color.a = 1.0
 
         m.lifetime.sec = 0
-        m.lifetime.nanosec = 200_000_000  # 200 ms auto-expire
+        m.lifetime.nanosec = 200_000_000
 
         self.marker_pub.publish(m)
 
@@ -620,7 +712,6 @@ class BoundaryPurePursuit(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = BoundaryPurePursuit()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

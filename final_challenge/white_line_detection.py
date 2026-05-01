@@ -24,8 +24,8 @@ MAX_DXDY        = 5.5    # |dx/dy| threshold for bottom-tangent VP filter
 HOUGH_THRESHOLD    = 20   # min accumulator votes for a line
 HOUGH_MIN_LINE_LEN = 25   # px – discard very short segments
 HOUGH_MAX_LINE_GAP = 15   # px – bridge small gaps within a line
-HOUGH_VERT_THRESH  = 0.3  # |dy/dx| lower bound — rejects near-horizontal artifacts
-HOUGH_VERT_MAX     = 0.9  # |dy/dx| upper bound — rejects cross-track / near-image-vertical lines
+HOUGH_VERT_THRESH  = 0.3  # |dy/dx| lower bound — rejects near-horizontal cross-track lines
+HOUGH_VERT_MAX     = 5.0  # |dy/dx| upper bound — keep near-vertical lane stripes when camera is close
 # Standard HoughLines + clustering parameters
 HOUGH_STD_THRESHOLD  = 30   # min accumulator votes for standard HoughLines
 HOUGH_CLUSTER_D_RHO   = 60  # px  – max ρ spread to merge into one cluster

@@ -3,19 +3,14 @@
        Lane-following on the real robot — Part A: The Great Snail Race
        ═══════════════════════════════════════════════════════════════════
 
-       Key args to set before racing:
-         track_side   "left" or "right" — which boundary to hug inward from
-         inward_offset  metres inside the chosen boundary (half lane width)
+       The follower drives the geometric center between the two detected
+       boundaries when both are visible, falling back to a learned half-lane
+       offset when only one side is detected. No track_side / inward_offset.
 
        Run with:
          ros2 launch final_challenge lane_follow_deploy.launch.xml
-         ros2 launch final_challenge lane_follow_deploy.launch.xml track_side:=right
   -->
 
-  <arg name="track_side"    default="left"
-       description="Which lane boundary to track: left or right"/>
-  <arg name="inward_offset" default="0.30"
-       description="Metres to drive inside the chosen boundary (≈ half lane width)"/>
   <arg name="nominal_speed" default="2.5"
        description="Target speed on straights (m/s, max 4.0)"/>
   <arg name="drive_topic"   default="/vesc/low_level/input/navigation"
@@ -29,12 +24,11 @@
   <!-- ── Vision: white-line detection + homography → /left_lane_line, /right_lane_line -->
   <node pkg="final_challenge" exec="lane_detector" output="screen"/>
 
-  <!-- ── Control: pure-pursuit on the selected boundary ────────────── -->
+  <!-- ── Control: bilateral midpoint pure-pursuit ────────────────── -->
   <node pkg="final_challenge" exec="boundary_pure_pursuit" output="screen">
     <param name="drive_topic"         value="$(var drive_topic)"/>
-    <param name="track_side"          value="$(var track_side)"/>
-    <param name="inward_offset"       value="$(var inward_offset)"/>
     <param name="nominal_speed"       value="$(var nominal_speed)"/>
+    <param name="half_width_init"     value="0.5"/>
 
     <!-- Lookahead distances (metres) -->
     <param name="lookahead_distance"           value="1.2"/>
