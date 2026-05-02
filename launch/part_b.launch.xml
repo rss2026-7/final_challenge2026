@@ -16,6 +16,15 @@
   <arg name="sim" default="false"
        description="Set true when running in the simulator (overrides odom/drive topics)"/>
 
+
+  <!-- Camera -->
+  <!-- ZED: ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zed -->
+  <include file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py">
+    <arg name="camera_model" value="zed"/>
+  </include>
+
+
+
   <!-- ── Basement goal point publisher ──────────────────────────────── -->
   <node pkg="final_challenge" exec="basement_point_publisher" output="screen"/>
 
