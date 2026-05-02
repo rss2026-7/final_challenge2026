@@ -70,7 +70,7 @@ class FinalChallengeStateMachine(Node):
         # ------------------------------------------------------------------ #
         self.declare_parameter("odom_topic",             "/pf/pose/odom")
         self.declare_parameter("drive_topic",            "/vesc/ackermann_cmd")
-        self.declare_parameter("arrival_threshold",      0.5)   # metres
+        self.declare_parameter("arrival_threshold",      0.75)  # metres
         self.declare_parameter("park_duration",          5.0)   # seconds
         self.declare_parameter("return_to_start",        True)
         self.declare_parameter("planning_wait_secs",     1.0)   # wait after sending goal
@@ -316,7 +316,15 @@ class FinalChallengeStateMachine(Node):
         Traffic-law interrupts are handled in _step() above.
         """
         goal = self.goal_locations[self.current_goal_idx]
-        if self._dist_to(goal) < self.arrival_threshold:
+        dist = self._dist_to(goal)
+        self.get_logger().info(
+            f"[NAVIGATING] goal_idx={self.current_goal_idx} "
+            f"goal=({goal[0]:.2f}, {goal[1]:.2f}) "
+            f"pose=({self.current_pose[0]:.2f}, {self.current_pose[1]:.2f}) "
+            f"dist={dist:.3f} threshold={self.arrival_threshold}",
+            throttle_duration_sec=1.0,
+        )
+        if dist < self.arrival_threshold:
             self._stop()
             self._to(State.ARRIVED)
 
