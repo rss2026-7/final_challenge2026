@@ -109,12 +109,12 @@ IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
 # the StoplightDetector ROS node never runs YOLO.
 YOLO_MODEL_NAME     = "yolo11n.pt"
 YOLO_CONF_THRESHOLD = 0.5
-YOLO_TARGET_CLASSES = {"parking_meter", "fire_hydrant", "bird", "traffic light"}
+YOLO_TARGET_CLASSES = {"parking meter", "fire hydrant", "traffic light", "person"}
 YOLO_CLASS_COLORS = {
-    "parking_meter": (0, 255, 0),
-    "fire_hydrant":  (0, 0, 255),
-    "bird":          (255, 165, 0),
+    "parking meter": (0, 255, 0),
+    "fire hydrant":  (0, 0, 255),
     "traffic light": (255, 255, 0),
+    "person":        (255, 0, 255),
 }
 
 

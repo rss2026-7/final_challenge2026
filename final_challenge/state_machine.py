@@ -97,7 +97,7 @@ class FinalChallengeStateMachine(Node):
         self.plan_sent_time     = None  # time goal was sent to planner
 
         # Signals set by teammate callbacks (None/False until integrated)
-        self.detected_sign      = None  # str e.g. "parking_meter" — set by [WEIMING]
+        self.detected_sign      = None  # str e.g. "parking meter" — set by [WEIMING]
         self.parking_done       = False # set by [KEVIN]
 
         # ------------------------------------------------------------------ #
@@ -359,7 +359,7 @@ class FinalChallengeStateMachine(Node):
 
         self._detect_start_time = None  # reset for next time
      
-        if self.detected_sign == "parking_meter":
+        if self.detected_sign == "parking meter":
             self.get_logger().info("Parking meter confirmed — handing off to parking controller.")
             self.parking_done = False
 

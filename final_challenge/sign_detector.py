@@ -18,13 +18,14 @@ from ultralytics import YOLO
 from vs_msgs.msg import ConeLocationPixel
 
 
-TARGET_CLASSES = {"parking_meter", "fire_hydrant", "bird", "traffic light"}
+# Names must match Ultralytics COCO labels exactly (with spaces).
+TARGET_CLASSES = {"parking meter", "fire hydrant", "traffic light", "person"}
 
 CLASS_COLORS = {
-    "parking_meter": (0, 255, 0),
-    "fire_hydrant":  (0, 0, 255),
-    "bird":          (255, 165, 0),
+    "parking meter": (0, 255, 0),
+    "fire hydrant":  (0, 0, 255),
     "traffic light": (255, 255, 0),
+    "person":        (255, 0, 255),
 }
 
 
@@ -132,7 +133,7 @@ class SignDetectorNode(Node):
         best = max(dets, key=lambda d: d.confidence)
 
         # Continuous: publish pixel location every frame for parking controller servo
-        if best.class_name == "parking_meter":
+        if best.class_name == "parking meter":
             cone_px = ConeLocationPixel()
             cone_px.u = float((best.x1 + best.x2) / 2)
             cone_px.v = float(best.y2)  # bottom-center, matches homography calibration
