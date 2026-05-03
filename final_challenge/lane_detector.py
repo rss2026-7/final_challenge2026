@@ -4,10 +4,12 @@ import cv2
 import numpy as np
 
 import rclpy
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from cv_bridge import CvBridge
 
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
 
@@ -20,10 +22,14 @@ from final_challenge.homography_transformer import build_homography, transform_u
 
 # Tunable
 N_SAMPLES = 15   # points sampled per detected Hough line
-MIN_VOTES = 5    # discard Hough clusters with fewer accumulator votes (filters noisy near-zero artifacts)
+MIN_VOTES = 5    # discard Hough clusters with fewer accumulator votes
 MAX_ABS_Y = 1.5  # discard candidate lines whose median car-frame |y| exceeds this (outliers from
                  # near-horizon homography projection)
-MIN_FORWARD_SPAN = 0.3  # path must span >= this many metres forward in car frame
+MIN_FORWARD_SPAN = 0.3  # forward-span gate applied to HOUGH detections only
+                        # (Hough lines are extrapolated and a short fit is
+                        # often noise). Blob spines skip this gate so the
+                        # controller sees the same short lines the calibration
+                        # GUI sees.
 MAX_X_CAR        = 4.0  # cap forward distance per sample. The homography horizon is at
                         # v ≈ 138 px and ROI top is at v ≈ 150 px, so samples near the
                         # ROI top project to wildly large x_car. 4 m is well past the
@@ -35,11 +41,10 @@ MAX_DY_OVER_DX = 0.4    # path must be roughly forward-aligned. Real boundaries 
 
 
 def _path_is_plausible_boundary(pts):
-    """A car-frame path is a plausible lane boundary iff it spans enough
-    forward distance and is roughly forward-aligned (small lateral slope).
-    Filters out cross-track markers and short fragments. Uses a regression
-    slope rather than first-last delta so blob spines (jittery per-row means)
-    don't get rejected on noise."""
+    """Strict plausibility check used for HOUGH detections only: forward-span
+    + slope cap + non-degenerate x-spread. See _spine_path_is_sane for the
+    blob equivalent (no forward-span gate, since the GUI's blob overlay is
+    the single source of truth)."""
     if len(pts) < 2:
         return False
     xs = np.array([p[0] for p in pts])
@@ -52,6 +57,47 @@ def _path_is_plausible_boundary(pts):
     if abs(slope) > MAX_DY_OVER_DX:
         return False
     return True
+
+
+def _spine_path_is_sane(pts):
+    """Blob-spine acceptance, intentionally lenient — matches the calibration
+    GUI's behavior (which displays raw blob spines with no car-frame filter).
+    Only the slope cap survives, so cross-track markers that slipped through
+    blob's internal _tangent_ok check still get rejected here. Short forward
+    spans are accepted: a partially-occluded boundary should not be dropped
+    just because the visible portion projects to <0.3 m of forward extent."""
+    if len(pts) < 2:
+        return False
+    xs = np.array([p[0] for p in pts])
+    ys = np.array([p[1] for p in pts])
+    if np.ptp(xs) < 1e-6:
+        return False
+    slope = np.polyfit(xs, ys, 1)[0]
+    if abs(slope) > MAX_DY_OVER_DX:
+        return False
+    return True
+
+
+def _image_space_slope(spine):
+    """du/dv slope of an image-space spine (u = horizontal pixel, v = vertical
+    pixel; v increases downward).
+
+    Sign convention used for single-line classification:
+      du/dv > 0  → line slants down-and-to-the-right in the image. The bottom
+                   end of the line sits to the RIGHT of its top end. This is
+                   what a RIGHT lane boundary looks like in standard image
+                   coords.
+      du/dv < 0  → line slants down-and-to-the-left → LEFT boundary.
+      du/dv ≈ 0  → near-vertical line; angle is ambiguous and we should fall
+                   back to lateral-position classification.
+    """
+    if len(spine) < 2:
+        return 0.0
+    us = np.array([p[0] for p in spine], dtype=float)
+    vs = np.array([p[1] for p in spine], dtype=float)
+    if np.ptp(vs) < 2.0:
+        return 0.0
+    return float(np.polyfit(vs, us, 1)[0])
 
 
 def _make_path(points, stamp, frame_id="base_link"):
@@ -78,12 +124,17 @@ class LaneDetector(Node):
 
     Detection strategy
     ------------------
-    Primary: detect_lane_lines_hough() — stable on straight sections.
-    Fallback: detect_white_lines() blob detector — handles curves where
-    Hough produces fewer than 2 valid lines.
+    1:1 with the calibration GUI: detect_white_lines() (blob) is the only
+    detector. Whatever spines the GUI overlays as green dots are the spines
+    we project through the homography and publish — no slope cap, no
+    forward-span gate, no median-y cut. The blob detector's own internal
+    filters (MIN_AREA → MIN_LONG_SIDE → MIN_ELONGATION → _tangent_ok) are
+    the single source of truth for what counts as a lane line. Hough is
+    intentionally not used here.
 
-    Left/right classification is done in the car frame (after homography),
-    not by image-space slope sign, so it remains correct on curves.
+    Single-line case: classified by image-space tilt (du/dv). Falling back
+    to lateral position only when the line is too close to vertical for the
+    angle to be unambiguous.
 
     Subscriptions
     -------------
@@ -106,11 +157,19 @@ class LaneDetector(Node):
         self.right_pub = self.create_publisher(Path,  "/right_lane_line", 10)
         self.debug_pub = self.create_publisher(Image, "/lane_debug_img",  10)
 
+        # BEST_EFFORT, KEEP_LAST(1): always work on the newest frame; if
+        # we ever fall behind, drop the backlog at the DDS layer rather
+        # than queueing stale images that produce stale lane detections.
+        latest_image_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+        )
         self.image_sub = self.create_subscription(
-            Image,
-            "/zed/zed_node/rgb/image_rect_color",
+            CompressedImage,
+            "/zed/zed_node/rgb/image_rect_color/compressed",
             self.image_callback,
-            5,
+            latest_image_qos,
         )
 
         self.get_logger().info("LaneDetector initialised.")
@@ -118,34 +177,80 @@ class LaneDetector(Node):
     # ------------------------------------------------------------------
     # Main callback
     # ------------------------------------------------------------------
-    def image_callback(self, msg: Image):
-        frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+    def image_callback(self, msg: CompressedImage):
+        arr = np.frombuffer(msg.data, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            self.get_logger().warn(
+                "lane_detector: cv2.imdecode returned None",
+                throttle_duration_sec=2.0,
+            )
+            return
         h, w  = frame.shape[:2]
         roi_top = int(ROI_TOP_FRAC * h)
         stamp = msg.header.stamp
 
-        left_pts, right_pts, debug_lines = self._detect_boundaries(frame, h, w, roi_top)
+        (left_pts, right_pts,
+         debug_lines, blob_spines) = self._detect_boundaries(
+            frame, h, w, roi_top
+        )
 
         self.left_pub.publish(_make_path(left_pts,  stamp))
         self.right_pub.publish(_make_path(right_pts, stamp))
-        self._publish_debug(frame, debug_lines, roi_top)
+        self._publish_debug(frame, debug_lines, blob_spines, roi_top)
 
     # ------------------------------------------------------------------
-    # Boundary detection — Hough primary, blob fallback
+    # Boundary detection — blob only, 1:1 with the calibration GUI
     # ------------------------------------------------------------------
     def _detect_boundaries(self, frame, h, w, roi_top):
         """
-        Return (left_pts, right_pts, debug_lines).
+        Return (left_pts, right_pts, debug_lines, blob_spines).
 
-        left_pts / right_pts : list of (x_car, y_car) sorted near-to-far.
-        debug_lines          : list of Hough line dicts for the debug image
-                               (may be empty when using blob fallback).
+        Whatever the calibration GUI shows as a green spine, this method
+        publishes. The only post-detection processing is the homography
+        projection itself, plus dropping points that don't project into
+        the car-frame strip 0 < x_car < MAX_X_CAR (the homography horizon
+        — points beyond it are numerically meaningless, not a content
+        filter).
         """
-        # ── Primary: Hough detector ───────────────────────────────────
-        hough_lines = detect_lane_lines_hough(frame)
+        blob_spines    = detect_white_lines(frame)
+        blob_car_lines = self._spines_to_car_lines(blob_spines)
 
-        # Convert every sufficiently-voted Hough line to car-frame points
-        # and record its median lateral position.
+        if not blob_car_lines:
+            self.get_logger().info(
+                f"No blob spines projected to a usable path "
+                f"(raw spines: {len(blob_spines)}).",
+                throttle_duration_sec=1.0,
+            )
+            return [], [], [], blob_spines
+
+        left_pts, right_pts = self._classify_car_lines(blob_car_lines)
+        return left_pts, right_pts, [], blob_spines
+
+    def _spines_to_car_lines(self, spines):
+        """1:1 with the calibration GUI: trust whatever detect_white_lines
+        returns. Project to car-frame, drop nothing on shape grounds. The
+        only criterion for skipping a spine is that fewer than 2 of its
+        points survived the projection's MAX_X_CAR clip — at which point
+        there's no path to publish.
+
+        Each entry carries the line's image-space slope so the single-line
+        classifier can decide left/right by tilt angle, not lateral
+        position alone."""
+        car_lines = []
+        for spine in spines:
+            pts = self._spine_to_car_pts(spine)
+            if len(pts) < 2:
+                continue
+            median_y = float(np.median([p[1] for p in pts]))
+            image_slope = _image_space_slope(spine)
+            car_lines.append((median_y, None, pts, image_slope))
+        return car_lines
+
+    def _hough_lines_to_car_lines(self, hough_lines, h, w, roi_top):
+        """Strict plausibility for the Hough fallback path: forward-span +
+        slope cap + accumulator-vote gate. Hough fits are noisier than blob
+        spines, so they need the tighter filter."""
         car_lines = []
         for ll in hough_lines:
             if ll['votes'] < MIN_VOTES:
@@ -156,49 +261,39 @@ class LaneDetector(Node):
             median_y = float(np.median([p[1] for p in pts]))
             if abs(median_y) > MAX_ABS_Y:
                 continue
-            car_lines.append((median_y, ll, pts))
+            # Hough returns x = m·y + b in image coords, so m IS du/dv.
+            image_slope = float(ll['coeffs'][0])
+            car_lines.append((median_y, ll, pts, image_slope))
+        return car_lines
 
+    # Slope (du/dv) magnitudes below this are treated as "near-vertical"
+    # and fall through to lateral-position classification.
+    SINGLE_LINE_SLOPE_DEADBAND = 0.05
+
+    def _classify_car_lines(self, car_lines):
+        """Two or more plausible lines: split innermost-pair as left/right
+        using their lateral position.
+
+        One line: classify by image-space tilt angle. A line slanting
+        down-and-to-the-right (du/dv > 0) is a RIGHT boundary; down-and-to-
+        the-left (du/dv < 0) is a LEFT boundary. Tilt is more stable than
+        lateral position when the car is hugging or straddling a boundary
+        (median_y can flip sign frame-to-frame in that case; the line's
+        tilt cannot). Falls back to median-y sign only when the line is
+        too close to vertical for the angle to be unambiguous."""
+        # _split_left_right expects 3-tuples; strip the slope.
         if len(car_lines) >= 2:
-            left_pts, right_pts = self._split_left_right(car_lines)
-            debug_lines = [ll for _, ll, _ in car_lines]
-            return left_pts, right_pts, debug_lines
+            return self._split_left_right([(c[0], c[1], c[2]) for c in car_lines])
 
-        # ── Fallback: blob detector (better on curves) ────────────────
-        # Blob fallback is a normal mode of operation — many frames yield <2
-        # Hough lines after plausibility filtering. Only warn if BOTH fail.
-        blob_spines = detect_white_lines(frame)
-
-        car_lines = []
-        for spine in blob_spines:
-            pts = self._spine_to_car_pts(spine)
-            if not _path_is_plausible_boundary(pts):
-                continue
-            median_y = float(np.median([p[1] for p in pts]))
-            if abs(median_y) > MAX_ABS_Y:
-                continue
-            car_lines.append((median_y, None, pts))
-
-        if len(car_lines) >= 2:
-            left_pts, right_pts = self._split_left_right(car_lines)
-            return left_pts, right_pts, []
-
-        # Both detectors found <2 plausible lines — this is a real degraded frame.
-        self.get_logger().warn(
-            "Both Hough and blob produced <2 valid lines.",
-            throttle_duration_sec=1.0,
-        )
-
-        # Only one or zero lines — classify the single line by the sign of its
-        # median y so it lands on its true side. Blindly assigning to "left"
-        # would steer the car toward the wall when the detection is on the right.
-        left_pts, right_pts = [], []
-        if car_lines:
-            median_y, _, pts = car_lines[0]
-            if median_y >= 0:
-                left_pts = pts
-            else:
-                right_pts = pts
-        return left_pts, right_pts, []
+        median_y, _, pts, image_slope = car_lines[0]
+        if image_slope > self.SINGLE_LINE_SLOPE_DEADBAND:
+            return [], pts          # tilts down-right → RIGHT lane line
+        if image_slope < -self.SINGLE_LINE_SLOPE_DEADBAND:
+            return pts, []          # tilts down-left  → LEFT lane line
+        # Near-vertical: angle is unreliable, fall back to lateral position.
+        if median_y >= 0:
+            return pts, []
+        return [], pts
 
     # ------------------------------------------------------------------
     # Left / right classification in car frame
@@ -275,23 +370,26 @@ class LaneDetector(Node):
     # ------------------------------------------------------------------
     # Debug image
     # ------------------------------------------------------------------
-    def _publish_debug(self, frame, debug_lines, roi_top):
+    def _publish_debug(self, frame, debug_lines, blob_spines, roi_top):
         dbg = frame.copy()
         h, w = dbg.shape[:2]
 
         cv2.line(dbg, (0, roi_top), (w, roi_top), (128, 128, 128), 1)
 
-        colors = [(0, 255, 0), (0, 255, 255), (255, 165, 0), (255, 0, 255)]
-        for i, ll in enumerate(debug_lines):
-            if ll is None:
-                continue
-            color = colors[i % len(colors)]
-            p1, p2 = ll['segment']
-            cv2.line(dbg, p1, p2, color, 2)
-            cv2.circle(dbg, p1, 4, color, -1)
-            cv2.circle(dbg, p2, 4, color, -1)
+        # Blob spines as green dots (matches the calibration GUI overlay).
+        for spine in blob_spines:
+            for (sx, sy) in spine:
+                cv2.circle(dbg, (sx, sy), 2, (0, 255, 0), -1)
 
-        cv2.putText(dbg, "lines=%d" % len(debug_lines),
+        # Hough lines that survived the plausibility / dedup pass — orange.
+        for ll in debug_lines:
+            p1, p2 = ll['segment']
+            cv2.line(dbg, p1, p2, (0, 200, 255), 2)
+            cv2.circle(dbg, p1, 4, (0, 200, 255), -1)
+            cv2.circle(dbg, p2, 4, (0, 200, 255), -1)
+
+        cv2.putText(dbg,
+                    f"blob={len(blob_spines)}  hough_kept={len(debug_lines)}",
                     (4, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         self.debug_pub.publish(self.bridge.cv2_to_imgmsg(dbg, "bgr8"))
@@ -300,11 +398,14 @@ class LaneDetector(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = LaneDetector()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

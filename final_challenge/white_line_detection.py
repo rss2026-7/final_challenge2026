@@ -16,7 +16,7 @@ import numpy as np
 ROI_TOP_FRAC    = 0.40   # fraction of image height to crop from top
 HSV_LOW         = np.array([  0,   0, 160])  # any hue, low sat, bright
 HSV_HIGH        = np.array([179,  60, 255])
-MIN_AREA        = 300    # px² – discard tiny speckles
+MIN_AREA        = 500    # px² – discard tiny speckles
 MIN_LONG_SIDE   = 40     # px – minimum length of the blob's long axis
 MIN_ELONGATION  = 3.0    # long_side / short_side – lane lines are thin & long
 MAX_DXDY        = 5.5    # |dx/dy| threshold for bottom-tangent VP filter
@@ -62,13 +62,16 @@ def _extract_spine(label_mask):
     mean x of those pixels. Returns a list of (x, y) in ROI coordinates,
     ordered top-to-bottom (increasing y).
     """
-    points = []
-    ys = np.where(np.any(label_mask, axis=1))[0]
-    for y in ys:
-        xs = np.where(label_mask[y])[0]
-        if len(xs) > 0:
-            points.append((int(np.mean(xs)), int(y)))
-    return points
+    rows, cols = np.where(label_mask)
+    if rows.size == 0:
+        return []
+    h = label_mask.shape[0]
+    counts = np.bincount(rows, minlength=h)
+    sums   = np.bincount(rows, weights=cols.astype(np.float64), minlength=h)
+    ys = np.nonzero(counts)[0]
+    # int() on a positive float truncates toward zero — match the original.
+    xs = (sums[ys] / counts[ys]).astype(np.int64)
+    return list(zip(xs.tolist(), ys.tolist()))
 
 
 def _local_dxdy(pts):

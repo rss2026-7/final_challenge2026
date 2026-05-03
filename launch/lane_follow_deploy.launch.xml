@@ -11,10 +11,19 @@
          ros2 launch final_challenge lane_follow_deploy.launch.xml
   -->
 
-  <arg name="nominal_speed" default="2.5"
+  <arg name="nominal_speed" default="2.0"
        description="Target speed on straights (m/s, max 4.0)"/>
   <arg name="drive_topic"   default="/vesc/low_level/input/navigation"
        description="AckermannDriveStamped topic consumed by the VESC"/>
+  <arg name="camera_y_offset" default="0.06"
+       description="Lateral distance (m) from the ZED LEFT-lens optical center
+                    to the robot's true centerline, measured along +y (left).
+                    Positive = camera mounted to the LEFT of robot center.
+                    Set to 0.0 if perception already publishes in base_link."/>
+  <arg name="cte_gain" default="1.0"
+       description="Cross-track-error feedback gain (rad/m). Higher = harder
+                    pull toward lane center when offset. Try 1.5–2.0 for more
+                    aggressive recovery, 0.5 for gentler driving."/>
 
   <!-- ── ZED camera ────────────────────────────────────────────────── -->
   <include file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py">
@@ -29,15 +38,18 @@
     <param name="drive_topic"         value="$(var drive_topic)"/>
     <param name="nominal_speed"       value="$(var nominal_speed)"/>
     <param name="half_width_init"     value="0.5"/>
+    <param name="camera_y_offset"     value="$(var camera_y_offset)"/>
+    <param name="cte_gain"            value="$(var cte_gain)"/>
+    <param name="enable_visualization" value="false"/>
 
     <!-- Lookahead distances (metres) -->
-    <param name="lookahead_distance"           value="1.2"/>
+    <param name="lookahead_distance"           value="1.68"/>
     <param name="lost_line_lookahead_distance" value="0.9"/>
     <param name="min_lookahead_distance"       value="0.5"/>
 
     <!-- Speed limits -->
     <param name="lost_line_speed" value="1.0"/>
-    <param name="min_speed"       value="0.6"/>
+    <param name="min_speed"       value="1.0"/>
     <param name="max_speed"       value="3.5"/>
 
     <!-- Curvature adaptation -->
@@ -47,12 +59,12 @@
     <!-- Staleness / safety -->
     <param name="stale_path_timeout"  value="0.75"/>
     <param name="fresh_msg_timeout"   value="0.2"/>
-    <param name="min_path_arc_length" value="0.3"/>
+    <param name="min_path_arc_length" value="0.0"/>
     <param name="stop_if_no_path"     value="true"/>
 
     <!-- Steering smoothing (0=none, 1=instant) -->
     <param name="steering_alpha"      value="0.35"/>
-    <param name="max_steering_angle"  value="0.40"/>
+    <param name="max_steering_angle"  value="0.13"/>
   </node>
 
 </launch>
