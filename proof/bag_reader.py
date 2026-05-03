@@ -7,13 +7,53 @@ Yields tuples (topic_name, bag_time_ns, payload) where payload is one of:
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import struct
 from typing import Dict, Iterator, Tuple
 
 import numpy as np
 
-DB = "/tmp/rosbag_johnson/rosbag2_2025_04_09-22_01_22/rosbag2_2025_04_09-22_01_22_0.db3"
+# Default bag location: extracted alongside this file. Override with $BAG_DB.
+# Common alternates also probed automatically below.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_db() -> str:
+    if "BAG_DB" in os.environ:
+        return os.environ["BAG_DB"]
+    candidates = [
+        os.path.join(_HERE, "rosbag2_2025_04_09-22_01_22",
+                     "rosbag2_2025_04_09-22_01_22_0.db3"),
+        "/tmp/rosbag_johnson/rosbag2_2025_04_09-22_01_22/"
+        "rosbag2_2025_04_09-22_01_22_0.db3",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+
+    # Not extracted yet — try to unzip the bag from a sibling .zip.
+    zip_candidates = [
+        os.path.join(_HERE, "johnson_track_rosbag.zip"),
+        os.path.join(_HERE, "..", "johnson_track_rosbag.zip"),
+    ]
+    for z in zip_candidates:
+        if os.path.exists(z):
+            import zipfile
+            print(f"bag_reader: extracting {z} into {_HERE} (one-time, ~2 GB) …")
+            with zipfile.ZipFile(z) as zf:
+                zf.extractall(_HERE)
+            for c in candidates:
+                if os.path.exists(c):
+                    return c
+            break
+
+    # Fall back to the proof-relative path; error message will point users
+    # to drop the .zip in proof/ if neither extracted nor zipped.
+    return candidates[0]
+
+
+DB = _resolve_db()
 
 
 # ───────────────────────────────────────────────────────────────────────

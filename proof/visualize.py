@@ -27,11 +27,11 @@ import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
-# ── Make the bag harness importable ─────────────────────────────────────
+# ── Make the harness modules importable ─────────────────────────────────
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, ".."))
-sys.path.insert(0, os.path.join(REPO, "bag_replay"))
-sys.path.insert(0, REPO)
+sys.path.insert(0, HERE)        # bag_reader.py, ros_shim.py, replay.py
+sys.path.insert(0, REPO)        # final_challenge package
 
 # ros_shim must come before any final_challenge import
 import ros_shim  # noqa: F401
@@ -47,10 +47,9 @@ from final_challenge.lane_detector import LaneDetector
 from final_challenge.lane_follower import BoundaryPurePursuit
 from sensor_msgs.msg import CompressedImage as CImsg
 
-from bag_reader import iter_bag, bag_extents
+from bag_reader import iter_bag, bag_extents, DB as BAG_DB
 
 # ── Config ──────────────────────────────────────────────────────────────
-BAG_DB = "/tmp/rosbag_johnson/rosbag2_2025_04_09-22_01_22/rosbag2_2025_04_09-22_01_22_0.db3"
 OUT_PATH = os.path.join(HERE, "output.mp4")
 
 # Camera y_offset is the only per-mount config the lane_follower needs;
@@ -388,8 +387,10 @@ def render_video(frames, synth, recorded, target_ts, target_lookup,
 def main():
     if not os.path.exists(BAG_DB):
         print(f"bag db not found at {BAG_DB}")
-        print("Extract johnson_track_rosbag.zip into /tmp/rosbag_johnson first.")
+        print("Place johnson_track_rosbag.zip in proof/ (or extract it there);")
+        print("alternatively set BAG_DB=/path/to/rosbag2_*_0.db3.")
         sys.exit(1)
+    print(f"using bag: {BAG_DB}")
     data = replay_and_capture()
     render_video(*data)
 

@@ -17,10 +17,14 @@ import sys
 import time
 from typing import Any, Dict, List, Tuple
 
-# Inject shim BEFORE any final_challenge import
-sys.path.insert(0, "/tmp/rosbag_johnson")
-sys.path.insert(0, "/home/adhoc/Desktop/final_challenge2026")
-import ros_shim  # noqa: F401  side-effect: installs fakes
+# Make this directory and the repo root importable. ros_shim must be
+# imported BEFORE any final_challenge import so the fake ROS modules are
+# installed in sys.modules first.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.abspath(os.path.join(_HERE, ".."))
+sys.path.insert(0, _HERE)
+sys.path.insert(0, _REPO)
+import ros_shim  # noqa: F401
 from ros_shim import (
     set_now_ns, get_now_ns, set_param_overrides,
     PUBLISH_LOG, _Image,
@@ -31,7 +35,7 @@ import cv2
 
 # Use the new BoundaryPurePursuit `camera_y_offset` parameter (post-rebase)
 # instead of the previous monkey-patch on transform_uv_to_xy.
-Y_OFFSET = float(os.environ.get("REPLAY_Y_OFFSET", "-0.18"))
+Y_OFFSET = float(os.environ.get("REPLAY_Y_OFFSET", "-0.28"))
 print(f"REPLAY_Y_OFFSET={Y_OFFSET:+.3f} m")
 
 from final_challenge.lane_detector import LaneDetector
@@ -44,7 +48,7 @@ from bag_reader import iter_bag, bag_extents
 # ───────────────────────────────────────────────────────────────────────
 # Config
 # ───────────────────────────────────────────────────────────────────────
-RESULTS_DIR = "/tmp/rosbag_johnson/results"
+RESULTS_DIR = os.path.join(_HERE, "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(os.path.join(RESULTS_DIR, "frames"), exist_ok=True)
 def _tag(name: str) -> str:

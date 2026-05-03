@@ -4,8 +4,10 @@ for each. Speed is held constant 3.5 m/s — the only moving variable is
 steering, which is what we're aligning."""
 from __future__ import annotations
 import sys, os
-sys.path.insert(0, "/tmp/rosbag_johnson")
-sys.path.insert(0, "/home/adhoc/Desktop/final_challenge2026")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.abspath(os.path.join(_HERE, ".."))
+sys.path.insert(0, _HERE)
+sys.path.insert(0, _REPO)
 import ros_shim  # noqa
 from ros_shim import set_now_ns, set_param_overrides
 import numpy as np
@@ -123,11 +125,13 @@ def main():
 
 if __name__ == "__main__":
     rows, best = main()
-    # Save CSV
+    out_dir = os.path.join(_HERE, "results")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "offset_sweep.csv")
     import csv
-    with open("/tmp/rosbag_johnson/results/offset_sweep.csv", "w", newline="") as f:
+    with open(out_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         for r in rows:
             w.writerow(r)
-    print("wrote results/offset_sweep.csv")
+    print(f"wrote {out_path}")
