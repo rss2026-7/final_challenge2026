@@ -40,7 +40,9 @@
   </node>
 
   <!-- ── Sign detector (also publishes /relative_cone_px for parking) ── -->
-  <node pkg="final_challenge" exec="sign_detector" output="screen"/>
+  <node pkg="final_challenge" exec="sign_detector" output="screen">
+    <param name="model" value="/home/racecar/racecar_ws/yolo11n.pt"/>
+  </node>
 
   <!-- ── Homography transformer: /relative_cone_px → /relative_cone ─── -->
   <node pkg="final_challenge" exec="homography_transformer" output="screen"/>
