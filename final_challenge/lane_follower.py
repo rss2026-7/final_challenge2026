@@ -44,11 +44,56 @@ proof/visualize.py keeps working unchanged.
 """
 from __future__ import annotations
 
+import csv
 import math
+import os
+import time
+from collections import deque
+from datetime import datetime
+from time import monotonic
 from typing import List, Optional, Tuple
 
 import numpy as np
 import rclpy
+
+
+def _resolve_lane_tune_dir() -> str:
+    """Resolve the per-run tuning directory shared with lane_detector.
+
+    Coordination strategy: env var LANE_TUNE_DIR wins. Otherwise, look
+    in ~/lane_tune for a run-* directory created in the last 10 s — if
+    found, reuse it (the other node started slightly before us); if
+    not, mint a new timestamped one. Two nodes launched together end
+    up in the same folder without explicit IPC."""
+    env = os.environ.get("LANE_TUNE_DIR")
+    if env:
+        d = os.path.expanduser(env)
+        os.makedirs(d, exist_ok=True)
+        return d
+    base = os.path.expanduser("~/lane_tune")
+    os.makedirs(base, exist_ok=True)
+    now = time.time()
+    recent = []
+    try:
+        for name in os.listdir(base):
+            if not name.startswith("run-"):
+                continue
+            full = os.path.join(base, name)
+            try:
+                mtime = os.path.getmtime(full)
+            except OSError:
+                continue
+            if os.path.isdir(full) and now - mtime < 10.0:
+                recent.append((mtime, full))
+    except OSError:
+        pass
+    if recent:
+        recent.sort(reverse=True)
+        return recent[0][1]
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    d = os.path.join(base, f"run-{ts}")
+    os.makedirs(d, exist_ok=True)
+    return d
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -126,16 +171,19 @@ class BoundaryPurePursuit(Node):
         self.declare_parameter("fit_x_max", 2.3)
         self.declare_parameter("fit_n_samples", 11)
         # Half-lane width used to synthesise the missing side.
-        self.declare_parameter("half_lane_width", 0.30)
+        # Track lane is 85 cm wide → half = 0.425 m (measured).
+        self.declare_parameter("half_lane_width", 0.425)
         # Lateral offset added to incoming path y so the controller works
-        # in a robot-center frame (camera mounted slightly off-center).
-        self.declare_parameter("camera_y_offset", -0.32)
+        # in a robot-center frame. Camera is 6.5 cm to the left of the
+        # rear axle (measured) → -0.065.
+        self.declare_parameter("camera_y_offset", -0.065)
         # Where to evaluate the parabola for the residual cross-track and
-        # heading-PD terms. 2.0 m at v=3.5 m/s is ~0.57 s preview — what
-        # the recorded driver effectively used (cone-pursuit base looked
-        # at 2.5 m). Closer eval points see weaker y-signal on this gently
-        # curving track and bias the lateral PD low.
-        self.declare_parameter("e_y_eval_x", 2.0)
+        # heading-PD terms. CSV showed left_xmax mean 1.90 m, right_xmax
+        # mean 1.95 m — eval at 2.0 m was extrapolating past the data and
+        # producing |e_y_raw| up to 1.85 m on the noisiest ticks. 1.5 m
+        # sits well inside the fit window so e_y is interpolation, not
+        # extrapolation.
+        self.declare_parameter("e_y_eval_x", 1.5)
         # Where to put the marker (visualizer's "target" dot).
         self.declare_parameter("marker_x", 1.5)
 
@@ -179,9 +227,21 @@ class BoundaryPurePursuit(Node):
         # real perception loss — so the freshness window is generous.
         self.declare_parameter("fresh_msg_timeout", 0.80)
         self.declare_parameter("stale_path_timeout", 1.50)
-        # If True, publish 0 m/s when no path is fresh; if False, hold the
-        # previous command. False matches the recorded driver.
-        self.declare_parameter("stop_if_no_path", False)
+        # If True, publish 0 m/s when no path is fresh; if False, hold
+        # the previous command. True prevents the start-of-run blind-
+        # drive that put the car one lane over before perception came
+        # online (see the run-20260503-050721 tuning trace).
+        self.declare_parameter("stop_if_no_path", True)
+
+        # ── tuning instrumentation ──────────────────────────────────────
+        # Per-tick CSV at <run_dir>/data.csv + a throttled console line
+        # every debug_print_every ticks. Run dir is shared with the
+        # lane_detector frame dump (see _resolve_lane_tune_dir above).
+        # Override the path with debug_log_path if you want the CSV in
+        # a specific spot. Disable by setting debug_log:=false once tuned.
+        self.declare_parameter("debug_log", True)
+        self.declare_parameter("debug_log_path", "")
+        self.declare_parameter("debug_print_every", 6)
 
         self._load_tunable_params()
 
@@ -212,6 +272,10 @@ class BoundaryPurePursuit(Node):
         self.latest_right_path: List[Tuple[float, float]] = []
         self.latest_left_path_time  = None
         self.latest_right_path_time = None
+        # Camera-message stamps (ns) from each side's path header. Logged
+        # per CSV row so an entry maps to frames/<stamp_ns>.jpg directly.
+        self.latest_left_stamp_ns: int = 0
+        self.latest_right_stamp_ns: int = 0
 
         # Controller state
         self.prev_e_y: Optional[float] = None
@@ -219,6 +283,14 @@ class BoundaryPurePursuit(Node):
         self.last_steer_smoothed = 0.0
         self.kappa_smoothed = 0.0
         self.last_target: Optional[Tuple[float, float, str]] = None
+        # Latch: stay in a non-driving "WAIT_BI" state until perception
+        # has produced a BILATERAL fix at least once. SINGLE_LINE is
+        # blocked before then because synthesising midline by offsetting
+        # one boundary by half_lane_width can land in the wrong lane
+        # (this is the start-of-run lane-skip mechanism the prior trace
+        # exposed). After the first BILATERAL, SINGLE_LINE is allowed
+        # as a normal fallback.
+        self._seen_bilateral: bool = False
 
         # Inverse homography exposed for the visualizer.
         from final_challenge.homography_transformer import build_homography
@@ -233,6 +305,51 @@ class BoundaryPurePursuit(Node):
         )
 
         self.add_on_set_parameters_callback(self._on_param_change)
+
+        # ── tuning instrumentation state ───────────────────────────────
+        self._tick_count = 0
+        self._t0 = monotonic()
+        self._prev_mode: Optional[str] = None
+        # 1 s rolling window at 33 Hz for σ(e_y), σ(δ), sign-flip count.
+        roll_n = max(8, int(round(self.control_rate_hz)))
+        self._roll_e_y: deque = deque(maxlen=roll_n)
+        self._roll_delta: deque = deque(maxlen=roll_n)
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_header = [
+            "t", "tick", "dt",
+            "left_stamp_ns", "right_stamp_ns",
+            "mode", "mode_changed", "n_pts", "n_bi", "n_single",
+            "left_n", "left_xmax", "left_age",
+            "right_n", "right_xmax", "right_age",
+            "fit_a", "fit_b", "fit_c", "slope",
+            "kappa_raw", "kappa_smoothed", "kappa_clamped", "kappa_clipped",
+            "e_y_raw", "e_y", "d_e_y",
+            "delta_arc", "delta_p", "delta_d", "delta_raw",
+            "delta_ema", "delta_slew", "delta_final",
+            "slew_clipped", "sat_clipped",
+            "speed",
+        ]
+        if self.debug_log:
+            try:
+                override = self.debug_log_path.strip()
+                if override:
+                    path = os.path.expanduser(override)
+                    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                else:
+                    tune_dir = _resolve_lane_tune_dir()
+                    path = os.path.join(tune_dir, "data.csv")
+                self._csv_file = open(path, "w", newline="")
+                self._csv_writer = csv.writer(self._csv_file)
+                self._csv_writer.writerow(self._csv_header)
+                self._csv_file.flush()
+                self.get_logger().info(f"[TUNE] writing CSV to {path}")
+            except OSError as e:
+                self.get_logger().warn(
+                    f"[TUNE] failed to open CSV ({e}) — continuing without it"
+                )
+                self._csv_file = None
+                self._csv_writer = None
 
         self.get_logger().info(
             f"BoundaryPurePursuit (arc-fit) started — "
@@ -266,6 +383,9 @@ class BoundaryPurePursuit(Node):
         self.fresh_msg_timeout = float(gp("fresh_msg_timeout").value)
         self.stale_path_timeout = float(gp("stale_path_timeout").value)
         self.stop_if_no_path = bool(gp("stop_if_no_path").value)
+        self.debug_log = bool(gp("debug_log").value)
+        self.debug_log_path = str(gp("debug_log_path").value)
+        self.debug_print_every = int(gp("debug_print_every").value)
 
     def _on_param_change(self, params) -> SetParametersResult:
         float_params = {
@@ -287,13 +407,19 @@ class BoundaryPurePursuit(Node):
         return SetParametersResult(successful=True)
 
     # ── path callbacks ─────────────────────────────────────────────────
+    @staticmethod
+    def _stamp_ns(stamp) -> int:
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
     def left_line_callback(self, msg: Path) -> None:
         self.latest_left_path = self._extract_valid_points(msg)
         self.latest_left_path_time = self.get_clock().now()
+        self.latest_left_stamp_ns = self._stamp_ns(msg.header.stamp)
 
     def right_line_callback(self, msg: Path) -> None:
         self.latest_right_path = self._extract_valid_points(msg)
         self.latest_right_path_time = self.get_clock().now()
+        self.latest_right_stamp_ns = self._stamp_ns(msg.header.stamp)
 
     def _extract_valid_points(self, msg: Path) -> List[Tuple[float, float]]:
         """Convert nav_msgs/Path → near-to-far list of (x, y) in robot-center
@@ -368,65 +494,151 @@ class BoundaryPurePursuit(Node):
     def control_loop(self) -> None:
         now = self.get_clock().now()
         now_ns = now.nanoseconds
+        self._tick_count += 1
 
-        pts, mode, _n_bi, _n_single = self._build_midline_samples()
+        if self.prev_time_ns is None:
+            dt_tick = 1.0 / max(self.control_rate_hz, 1.0)
+        else:
+            dt_tick = max((now_ns - self.prev_time_ns) * 1e-9, 1e-3)
 
-        # Need ≥4 samples for a stable Kasa fit
-        if len(pts) < 4:
-            self._publish_marker(self.last_target, "STALE",
+        pts, mode, n_bi, n_single = self._build_midline_samples()
+        if mode == "BILATERAL":
+            self._seen_bilateral = True
+        gate_wait_bi = (mode == "SINGLE_LINE" and not self._seen_bilateral)
+        if gate_wait_bi:
+            mode = "WAIT_BI"
+        mode_changed = (
+            self._prev_mode is not None and self._prev_mode != mode
+        )
+        self._prev_mode = mode
+
+        L = self.latest_left_path
+        R = self.latest_right_path
+        left_xmax = L[-1][0] if L else float("nan")
+        right_xmax = R[-1][0] if R else float("nan")
+        left_age = (
+            (now - self.latest_left_path_time).nanoseconds * 1e-9
+            if self.latest_left_path_time is not None else float("nan")
+        )
+        right_age = (
+            (now - self.latest_right_path_time).nanoseconds * 1e-9
+            if self.latest_right_path_time is not None else float("nan")
+        )
+
+        dbg = {
+            "dt": dt_tick,
+            "left_stamp_ns": self.latest_left_stamp_ns,
+            "right_stamp_ns": self.latest_right_stamp_ns,
+            "mode": mode, "mode_changed": mode_changed,
+            "n_pts": len(pts), "n_bi": n_bi, "n_single": n_single,
+            "left_n": len(L), "left_xmax": left_xmax, "left_age": left_age,
+            "right_n": len(R), "right_xmax": right_xmax, "right_age": right_age,
+            "fit_a": float("nan"), "fit_b": float("nan"), "fit_c": float("nan"),
+            "slope": 0.0,
+            "kappa_raw": float("nan"),
+            "kappa_smoothed": self.kappa_smoothed,
+            "kappa_clamped": float("nan"), "kappa_clipped": False,
+            "e_y_raw": float("nan"), "e_y": float("nan"), "d_e_y": 0.0,
+            "delta_arc": 0.0, "delta_p": 0.0, "delta_d": 0.0,
+            "delta_raw": 0.0,
+            "delta_ema": self.last_steer_smoothed,
+            "delta_slew": self.last_steer_smoothed,
+            "delta_final": self.last_steer_smoothed,
+            "slew_clipped": False, "sat_clipped": False,
+            "speed": float("nan"),
+        }
+
+        # Need ≥4 samples for a stable parabola fit, AND we must have
+        # seen a BILATERAL fix at least once (else any SINGLE_LINE
+        # detection is treated as not-yet-tracking).
+        if len(pts) < 4 or gate_wait_bi:
+            marker_label = "WAIT_BI" if gate_wait_bi else "STALE"
+            self._publish_marker(self.last_target, marker_label,
                                  color=(1.0, 0.0, 0.0))
             if self.stop_if_no_path:
                 self._publish_drive(0.0, 0.0)
+                dbg["delta_final"] = 0.0
+                dbg["speed"] = 0.0
             else:
                 self._publish_drive(self.nominal_speed,
                                     self.last_steer_smoothed)
+                dbg["speed"] = self.nominal_speed
+            self._log_tick(dbg)
             return
 
         # ── arc feed-forward: parabola fit, signed-curvature bicycle ───
+        # Gate the curvature FF on FULL bilateral coverage. Mixing
+        # BILATERAL and SINGLE_LINE-synthesized samples in one polyfit
+        # produces phantom curvature whose sign and magnitude depend on
+        # the L/R coverage geometry, not the road. When gated:
+        #   - δ_arc forced to 0 (don't fight the lateral P term)
+        #   - kappa_smoothed multiplicatively decayed so the τ ≈ 3 s EMA
+        #     can't latch onto the saturated state for many seconds
+        # See run-20260503-052900: with the unguarded FF the controller
+        # sat at δ ≈ +0.013 rad for 17 s while e_y was +0.36 m — the FF
+        # cancelled 72 % of the P term every tick.
         fit = fit_arc_parabola(pts)
         x_eval = self.e_y_eval_x
-        if fit is None:
+        ff_gated = (fit is None) or (n_bi < len(pts))
+        if ff_gated:
             delta_arc = 0.0
-            e_y = pts[0][1]
-            slope = 0.0
+            self.kappa_smoothed *= 0.90
+            if fit is None:
+                e_y_raw = pts[0][1]
+                slope = 0.0
+            else:
+                fa, fb, fc = fit
+                dbg["fit_a"], dbg["fit_b"], dbg["fit_c"] = fa, fb, fc
+                slope = 2.0 * fa * x_eval + fb
+                e_y_raw = fa * x_eval * x_eval + fb * x_eval + fc
+            e_y = clamp(e_y_raw, -0.5, 0.5)
+            dbg["kappa_smoothed"] = self.kappa_smoothed
         else:
-            a, b, c = fit
+            fa, fb, fc = fit
+            dbg["fit_a"], dbg["fit_b"], dbg["fit_c"] = fa, fb, fc
             # κ = y''(x) / (1 + y'(x)²)^(3/2), evaluated at x_eval.
             # +y is left in robot frame, so positive κ ⇒ left curve ⇒ δ > 0.
-            slope = 2.0 * a * x_eval + b
-            kappa_raw = (2.0 * a) / (1.0 + slope * slope) ** 1.5
-            # EMA: only sustained curvature passes; per-frame fit noise
-            # decays out before reaching the steering output.
+            slope = 2.0 * fa * x_eval + fb
+            kappa_raw = (2.0 * fa) / (1.0 + slope * slope) ** 1.5
             ka = clamp(self.kappa_alpha, 0.0, 1.0)
             self.kappa_smoothed = (
                 ka * kappa_raw + (1.0 - ka) * self.kappa_smoothed
             )
-            kappa = clamp(
+            kappa_clamped = clamp(
                 self.kappa_smoothed,
                 -self.max_curvature, self.max_curvature,
             )
-            delta_arc = math.atan(self.wheelbase * kappa)
+            dbg["kappa_raw"] = kappa_raw
+            dbg["kappa_smoothed"] = self.kappa_smoothed
+            dbg["kappa_clamped"] = kappa_clamped
+            dbg["kappa_clipped"] = (kappa_clamped != self.kappa_smoothed)
+            delta_arc = math.atan(self.wheelbase * kappa_clamped)
             # Clamp e_y to a physically plausible range. Outside ±0.5 m
             # the controller is well off-lane; further amplification
             # produces saturation spikes that don't help.
-            e_y = clamp(a * x_eval * x_eval + b * x_eval + c, -0.5, 0.5)
+            e_y_raw = fa * x_eval * x_eval + fb * x_eval + fc
+            e_y = clamp(e_y_raw, -0.5, 0.5)
+        dbg["slope"] = slope
+        dbg["e_y_raw"] = e_y_raw
+        dbg["e_y"] = e_y
+        dbg["delta_arc"] = delta_arc
 
         # ── lateral PD trim on residual cross-track at e_y_eval_x ──────
         if self.prev_time_ns is None or self.prev_e_y is None:
             d_e_y = 0.0
         else:
-            dt = max((now_ns - self.prev_time_ns) * 1e-9, 1e-3)
-            d_e_y = (e_y - self.prev_e_y) / dt
-
-        delta_raw = delta_arc + self.kp_lat * e_y + self.kd_lat * d_e_y
+            d_e_y = (e_y - self.prev_e_y) / dt_tick
+        delta_p = self.kp_lat * e_y
+        delta_d = self.kd_lat * d_e_y
+        delta_raw = delta_arc + delta_p + delta_d
+        dbg["d_e_y"] = d_e_y
+        dbg["delta_p"] = delta_p
+        dbg["delta_d"] = delta_d
+        dbg["delta_raw"] = delta_raw
 
         # ── EMA + slew limit + saturate ────────────────────────────────
-        a = clamp(self.steering_alpha, 0.0, 1.0)
-        delta_ema = a * delta_raw + (1.0 - a) * self.last_steer_smoothed
-        if self.prev_time_ns is None:
-            dt_tick = 1.0 / max(self.control_rate_hz, 1.0)
-        else:
-            dt_tick = max((now_ns - self.prev_time_ns) * 1e-9, 1e-3)
+        alpha = clamp(self.steering_alpha, 0.0, 1.0)
+        delta_ema = alpha * delta_raw + (1.0 - alpha) * self.last_steer_smoothed
         max_step = self.max_steering_rate * dt_tick
         delta_slew = clamp(
             delta_ema,
@@ -436,6 +648,12 @@ class BoundaryPurePursuit(Node):
         steering_angle = clamp(
             delta_slew, -self.max_steering_angle, self.max_steering_angle,
         )
+        dbg["delta_ema"] = delta_ema
+        dbg["delta_slew"] = delta_slew
+        dbg["delta_final"] = steering_angle
+        dbg["slew_clipped"] = (delta_slew != delta_ema)
+        dbg["sat_clipped"] = (steering_angle != delta_slew)
+        dbg["speed"] = self.nominal_speed
 
         self.prev_e_y = e_y
         self.prev_time_ns = now_ns
@@ -456,6 +674,75 @@ class BoundaryPurePursuit(Node):
         )
         self._publish_marker(target, mode, color=marker_color)
         self._publish_drive(self.nominal_speed, steering_angle)
+
+        self._log_tick(dbg)
+
+    # ── tuning instrumentation ─────────────────────────────────────────
+    def _log_tick(self, dbg: dict) -> None:
+        t = monotonic() - self._t0
+        if self.debug_log and self._csv_writer is not None:
+            row = [
+                f"{t:.4f}", self._tick_count, f"{dbg['dt']:.4f}",
+                dbg["left_stamp_ns"], dbg["right_stamp_ns"],
+                dbg["mode"], int(bool(dbg["mode_changed"])),
+                dbg["n_pts"], dbg["n_bi"], dbg["n_single"],
+                dbg["left_n"], dbg["left_xmax"], dbg["left_age"],
+                dbg["right_n"], dbg["right_xmax"], dbg["right_age"],
+                dbg["fit_a"], dbg["fit_b"], dbg["fit_c"], dbg["slope"],
+                dbg["kappa_raw"], dbg["kappa_smoothed"],
+                dbg["kappa_clamped"], int(bool(dbg["kappa_clipped"])),
+                dbg["e_y_raw"], dbg["e_y"], dbg["d_e_y"],
+                dbg["delta_arc"], dbg["delta_p"], dbg["delta_d"],
+                dbg["delta_raw"], dbg["delta_ema"],
+                dbg["delta_slew"], dbg["delta_final"],
+                int(bool(dbg["slew_clipped"])), int(bool(dbg["sat_clipped"])),
+                dbg["speed"],
+            ]
+            try:
+                self._csv_writer.writerow(row)
+                self._csv_file.flush()
+            except (OSError, ValueError) as e:
+                self.get_logger().warn(f"[TUNE] CSV write failed: {e}")
+
+        if not math.isnan(dbg["e_y"]):
+            self._roll_e_y.append(dbg["e_y"])
+        if not math.isnan(dbg["delta_final"]):
+            self._roll_delta.append(dbg["delta_final"])
+
+        if (self.debug_print_every > 0
+                and self._tick_count % self.debug_print_every == 0):
+            self._print_tune_line(t, dbg)
+
+    def _print_tune_line(self, t: float, dbg: dict) -> None:
+        e_arr = list(self._roll_e_y)
+        d_arr = list(self._roll_delta)
+        e_std = float(np.std(e_arr)) if e_arr else 0.0
+        d_std = float(np.std(d_arr)) if d_arr else 0.0
+        flips = sum(
+            1 for i in range(1, len(d_arr))
+            if d_arr[i - 1] * d_arr[i] < 0.0
+        )
+        flag = ""
+        if dbg["slew_clipped"]:  flag += "S"
+        if dbg["sat_clipped"]:   flag += "T"
+        if dbg["kappa_clipped"]: flag += "K"
+        if dbg["mode_changed"]:  flag += "M"
+        if not flag:
+            flag = "-"
+        e_y = dbg["e_y"]
+        df = dbg["delta_final"]
+        e_y_str = f"{e_y:+.3f}" if not math.isnan(e_y) else "  nan"
+        df_str = f"{df:+.3f}" if not math.isnan(df) else "  nan"
+        self.get_logger().info(
+            f"[TUNE t={t:6.2f}s] {dbg['mode']:<11} "
+            f"n={dbg['n_pts']:2d}(bi={dbg['n_bi']} sg={dbg['n_single']}) "
+            f"e_y={e_y_str}(σ={e_std:.3f}) "
+            f"δ={df_str}(σ={d_std:.3f} flips={flips:2d}) "
+            f"ff={dbg['delta_arc']:+.3f} "
+            f"P={dbg['delta_p']:+.3f} "
+            f"D={dbg['delta_d']:+.3f} "
+            f"flag={flag}"
+        )
 
     # ── publishers ─────────────────────────────────────────────────────
     def _publish_drive(self, speed: float, steering_angle: float) -> None:
@@ -505,6 +792,11 @@ def main(args=None) -> None:
         pass
     finally:
         node._publish_drive(0.0, 0.0)
+        if getattr(node, "_csv_file", None) is not None:
+            try:
+                node._csv_file.close()
+            except OSError:
+                pass
         node.destroy_node()
         rclpy.shutdown()
 
