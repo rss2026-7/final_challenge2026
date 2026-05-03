@@ -503,12 +503,6 @@ class BoundaryPurePursuit(Node):
         hw = self.half_lane_width
         full_width = 2.0 * hw
         tol = self.width_tol
-        # When we have to fall back to single-side on a width-rejected
-        # pair, prefer whichever side has more raw detected points
-        # globally for this tick. (Per-x density is unavailable.)
-        prefer_left = (
-            L is not None and R is not None and len(L) >= len(R)
-        ) or (L is not None and R is None)
         for x in xs:
             yl = interp_y_at_x(L, float(x)) if L is not None else None
             yr = interp_y_at_x(R, float(x)) if R is not None else None
@@ -517,13 +511,18 @@ class BoundaryPurePursuit(Node):
                     pts.append((float(x), 0.5 * (yl + yr)))
                     n_bi += 1
                 else:
-                    # width-inconsistent pair → fall back to single-side
+                    # Width-rejected pair → DROP the sample. The previous
+                    # fallback chose the side with more raw points
+                    # globally; on run-20260503-063156 that picked the
+                    # wrong side ~50 % of the time on lopsided ticks
+                    # (typically the side that was actually across the
+                    # track), placing the synthesised midline 2-3 m off
+                    # in the wrong direction. Dropping forces the parabola
+                    # to fit only mutually-consistent samples; if too few
+                    # remain the existing len(pts)<4 STALE branch fires
+                    # and the controller stops or holds (per
+                    # stop_if_no_path), which is safer than guessing.
                     n_width_reject += 1
-                    if prefer_left:
-                        pts.append((float(x), yl - hw))
-                    else:
-                        pts.append((float(x), yr + hw))
-                    n_single += 1
             elif yl is not None:
                 pts.append((float(x), yl - hw))
                 n_single += 1

@@ -424,9 +424,6 @@ class LaneDetector(Node):
         hw = self.half_lane_width
         full_width = 2.0 * hw
         tol = self.width_tol
-        prefer_left = (
-            len(L) >= 2 and len(R) >= 2 and len(L) >= len(R)
-        ) or (len(L) >= 2 and len(R) < 2)
         for x in xs:
             yl = self._interp_y_at_x(L, float(x)) if len(L) >= 2 else None
             yr = self._interp_y_at_x(R, float(x)) if len(R) >= 2 else None
@@ -434,12 +431,9 @@ class LaneDetector(Node):
                 if abs((yl - yr) - full_width) <= tol:
                     midline.append((float(x), 0.5 * (yl + yr)))
                     n_bi += 1
-                else:
-                    if prefer_left:
-                        midline.append((float(x), yl - hw))
-                    else:
-                        midline.append((float(x), yr + hw))
-                    n_single += 1
+                # else: width-rejected — drop the sample (mirrors
+                # lane_follower's behaviour so the overlay parabola
+                # tracks the controller's fit).
             elif yl is not None:
                 midline.append((float(x), yl - hw))
                 n_single += 1

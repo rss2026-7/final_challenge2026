@@ -1,35 +1,35 @@
 <launch>
   <!-- ═══════════════════════════════════════════════════════════════════
        Lane-following on the real robot — Part A: The Great Snail Race
-       ═══════════════════════════════════════════════════════════════════
-
-       BoundaryPurePursuit was rewritten as a parking-controller-style PD
-       on a fake-cone target (lane midpoint at a fixed forward distance).
-       The previous pure-pursuit-with-long-lookahead-and-heavy-EMA matched
-       the recorded ackermann_cmd in mean and amplitude but produced a
-       much smoother trace (Pearson r=0.305, std=0.015) than the recorded
-       driver's (std=0.021 with 105 zero-crossings, lots of 5-15 Hz energy).
-       The PD-on-angle-to-target formulation reproduces that high-freq
-       wiggle character (Pearson r=0.587, std=0.027, 108 zero-crossings).
 
        Run with:
          ros2 launch final_challenge lane_follow_deploy.launch.xml
-  -->
 
-  <!-- ── Args (CLI-overridable) ─────────────────────────────────────── -->
-  <arg name="nominal_speed" default="3.5"
-       description="Target speed on straights (m/s, max 4.0). Set to match
-                    the recorded constant 3.5 m/s."/>
-  <arg name="drive_topic"   default="/vesc/low_level/input/navigation"
-       description="AckermannDriveStamped topic consumed by the VESC"/>
-  <arg name="camera_y_offset" default="-0.32"
-       description="Lateral offset (m) added to incoming path-y so the
-                    controller works in a robot-center frame. +y = LEFT in
-                    REP-103. The Johnson Track sweep landed at -0.32 m for
-                    the cone-pursuit configuration; bundles the camera's
-                    mechanical mount offset (~-0.06 m) with a residual
-                    detector + homography asymmetry. Recalibrate per camera
-                    mount/track via proof/sweep_offset.py."/>
+       Controller is BoundaryPurePursuit (lane_follower.py):
+         midline = parabola fit through L/R lane samples → cross-track at
+         e_y_eval_x → P + arc-FF (gated on full bilateral coverage) →
+         EMA + slew + saturate.
+       Source defaults are the live-robot values; this launch file only
+       overrides what's strictly environment-specific (the VESC topic).
+       Other params can be overridden on the CLI:
+         ros2 launch final_challenge lane_follow_deploy.launch.xml \
+              nominal_speed:=1.5 stop_if_no_path:=false
+       ═══════════════════════════════════════════════════════════════════ -->
+
+  <!-- ── CLI-overridable args ──────────────────────────────────────── -->
+  <arg name="nominal_speed" default="2.0"
+       description="Target speed (m/s). 2.0 was chosen after run-20260503-060123
+                    showed catch-up distance at 3.5 m/s was 4.8× the lane
+                    half-width (structural under-damping). Raise once the
+                    controller's tracking is verified clean at this speed."/>
+  <arg name="drive_topic" default="/vesc/low_level/input/navigation"
+       description="AckermannDriveStamped topic consumed by the VESC."/>
+  <arg name="stop_if_no_path" default="true"
+       description="If true, publish 0 m/s when no fresh path is available
+                    (also at startup before first BILATERAL fix). Prevents
+                    the start-of-run blind-drive that put the car one lane
+                    over in run-20260503-050721. Set false for graceful
+                    degradation during brief perception dropouts."/>
 
   <!-- ── ZED camera ────────────────────────────────────────────────── -->
   <include file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py">
@@ -39,41 +39,15 @@
   <!-- ── Vision: white-line detection + homography ────────────────── -->
   <node pkg="final_challenge" exec="lane_detector" output="screen"/>
 
-  <!-- ── Control: cone-pursuit PD on lane midpoint ────────────────── -->
+  <!-- ── Control: parabola-fit lane follower ──────────────────────── -->
+  <!-- All other params (kp_lat=0.30, kd_lat=0.0, half_lane_width=0.425,
+       width_tol=0.20, camera_y_offset=-0.065, e_y_eval_x=1.5, etc.) are
+       declared with their measured/tuned defaults inside lane_follower.py.
+       Only environment-specific overrides are needed here. -->
   <node pkg="final_challenge" exec="boundary_pure_pursuit" output="screen">
-    <param name="drive_topic"     value="$(var drive_topic)"/>
-    <param name="nominal_speed"   value="$(var nominal_speed)"/>
-    <param name="camera_y_offset" value="$(var camera_y_offset)"/>
-
-    <!-- PD gains. parking_controller uses Kp=1.0, Kd=0.1 on a single-cone
-         target; lane-midpoint targets are ~10× noisier (per-frame stripe
-         wobble), so Kp=0.35 keeps the steering inside the recorded
-         envelope and Kd=0 avoids amplifying detector noise into clipped
-         spikes. -->
-    <param name="kp_steer" value="0.35"/>
-    <param name="kd_steer" value="0.0"/>
-    <param name="max_steering_angle" value="0.34"/>
-
-    <!-- Geometry: sample the lane midpoint at this forward distance to
-         build the fake-cone target. Far enough that frame-to-frame y noise
-         (~few cm) translates to small angular jitter (~1.5°) — matches the
-         recorded driver's ~110 zero-crossings over 100 s. Half_lane is
-         the constant offset used when only one boundary is visible. -->
-    <param name="target_forward_distance" value="2.5"/>
-    <param name="half_lane_width"         value="0.30"/>
-
-    <!-- Control loop rate. Recorded driver was 33.5 Hz (2× 16 Hz camera);
-         match that. Per-tick math is sub-millisecond. -->
-    <param name="control_rate_hz" value="33.0"/>
-
-    <!-- Freshness / safety. The Johnson Track recording has 67 camera-
-         frame gaps >500 ms (max 736 ms) — recording artifact, not real
-         perception loss. Wide windows ride them out. With stop_if_no_path
-         off, the controller holds its last command across the gap rather
-         than emitting zero. Flip to true for a hard safety-stop. -->
-    <param name="fresh_msg_timeout"  value="0.80"/>
-    <param name="stale_path_timeout" value="1.50"/>
-    <param name="stop_if_no_path"    value="false"/>
+    <param name="drive_topic"      value="$(var drive_topic)"/>
+    <param name="nominal_speed"    value="$(var nominal_speed)"/>
+    <param name="stop_if_no_path"  value="$(var stop_if_no_path)"/>
   </node>
 
 </launch>
