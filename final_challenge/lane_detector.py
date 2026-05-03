@@ -342,16 +342,12 @@ class LaneDetector(Node):
         horizon makes far samples meaningless).
         """
         m, b = ll['coeffs']
-        pts  = []
-        for y_px in np.linspace(h - 1, roi_top, N_SAMPLES):
-            x_px = m * y_px + b
-            if x_px < 0 or x_px > w - 1:
-                continue
-            x_car, y_car = transform_uv_to_xy(self.H, float(x_px), float(y_px))
-            if 0.0 < x_car < MAX_X_CAR:
-                pts.append((x_car, y_car))
-        pts.sort(key=lambda p: p[0])
-        return pts
+        ys = np.linspace(h - 1, roi_top, N_SAMPLES)
+        xs = m * ys + b
+        keep = (xs >= 0) & (xs <= w - 1)
+        if not keep.any():
+            return []
+        return self._project_uv_array(xs[keep], ys[keep])
 
     def _spine_to_car_pts(self, spine):
         """Convert a blob spine to car-frame points, near-to-far.
@@ -359,13 +355,38 @@ class LaneDetector(Node):
         Cap x_car at MAX_X_CAR for the same reason as Hough: rows near the
         ROI top project past the homography horizon and produce noise.
         """
-        pts = []
-        for u, v in spine:
-            x_car, y_car = transform_uv_to_xy(self.H, float(u), float(v))
-            if 0.0 < x_car < MAX_X_CAR:
-                pts.append((x_car, y_car))
-        pts.sort(key=lambda p: p[0])
-        return pts
+        if not spine:
+            return []
+        arr = np.asarray(spine, dtype=np.float64)
+        return self._project_uv_array(arr[:, 0], arr[:, 1])
+
+    def _project_uv_array(self, us, vs):
+        """Batch homography projection for a vector of (u, v) pixel coords.
+        Returns the projected points as a near-to-far list of (x, y) tuples,
+        filtered to the strip 0 < x_car < MAX_X_CAR.
+        """
+        n = us.shape[0]
+        if n == 0:
+            return []
+        homo = np.empty((3, n), dtype=np.float64)
+        homo[0] = us
+        homo[1] = vs
+        homo[2] = 1.0
+        proj = self.H @ homo
+        w = proj[2]
+        # Avoid divide-by-zero on the horizon line (proj[2] == 0).
+        valid_w = np.abs(w) > 1e-12
+        x_car = np.where(valid_w, proj[0] / np.where(valid_w, w, 1.0),
+                         np.inf)
+        y_car = np.where(valid_w, proj[1] / np.where(valid_w, w, 1.0),
+                         np.inf)
+        mask = valid_w & (x_car > 0.0) & (x_car < MAX_X_CAR)
+        if not mask.any():
+            return []
+        x_car = x_car[mask]
+        y_car = y_car[mask]
+        order = np.argsort(x_car)
+        return list(zip(x_car[order].tolist(), y_car[order].tolist()))
 
     # ------------------------------------------------------------------
     # Debug image

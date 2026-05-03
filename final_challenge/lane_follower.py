@@ -183,6 +183,17 @@ class BoundaryPurePursuit(Node):
         self.declare_parameter("stale_path_timeout", 0.75)
         # How old a "latest" message can be before we consider it stale (seconds)
         self.declare_parameter("fresh_msg_timeout", 0.2)
+        # How long to keep using the last bilateral midpoint after one side
+        # momentarily drops out (BILATERAL_HOLD coverage). Longer = the
+        # controller stays on the bilateral target across short detection
+        # blackouts instead of jumping into SINGLE_LINE's offset path.
+        self.declare_parameter("bilateral_hold_window", 0.3)
+        # Control loop rate (Hz). Default 20 Hz matches the previous hard-
+        # coded value. Higher rates give smoother steering and faster
+        # response to fresh detections; the per-tick work is dominated by
+        # path interpolation + pure pursuit math, both O(<200 points) and
+        # well under 1 ms, so 50–100 Hz is realistic on the Jetson.
+        self.declare_parameter("control_rate_hz", 20.0)
         # Minimum arc length of a single boundary path to be useful (meters).
         # Set to 0 so the controller accepts whatever the calibration-GUI-
         # equivalent detection pipeline publishes — even a 2-point spine
@@ -313,9 +324,14 @@ class BoundaryPurePursuit(Node):
         # BILATERAL→SINGLE_LINE can shift target ~half-width laterally)
         self.prev_target: Optional[Tuple[float, float]] = None
 
-        # 20 Hz control loop
+        # Control loop — rate from parameter (default 20 Hz).
+        control_rate_hz = float(self.get_parameter("control_rate_hz").value)
+        if control_rate_hz <= 0:
+            control_rate_hz = 20.0
+        self.control_period_sec = 1.0 / control_rate_hz
         self.control_timer = self.create_timer(
-            0.05, self.control_loop, callback_group=self.control_cbgroup,
+            self.control_period_sec, self.control_loop,
+            callback_group=self.control_cbgroup,
         )
 
         self.add_on_set_parameters_callback(self._on_param_change)
@@ -356,6 +372,9 @@ class BoundaryPurePursuit(Node):
 
         self.stale_path_timeout = float(self.get_parameter("stale_path_timeout").value)
         self.fresh_msg_timeout = float(self.get_parameter("fresh_msg_timeout").value)
+        self.bilateral_hold_window = float(
+            self.get_parameter("bilateral_hold_window").value
+        )
         self.min_path_arc_length = float(self.get_parameter("min_path_arc_length").value)
         self.stop_if_no_path = bool(self.get_parameter("stop_if_no_path").value)
         self.steering_alpha = float(self.get_parameter("steering_alpha").value)
@@ -372,6 +391,7 @@ class BoundaryPurePursuit(Node):
             "half_width_init", "half_width_alpha",
             "half_width_min", "half_width_max",
             "stale_path_timeout", "fresh_msg_timeout",
+            "bilateral_hold_window",
             "min_path_arc_length", "steering_alpha", "target_alpha",
             "cte_gain", "camera_y_offset",
         }
@@ -575,13 +595,12 @@ class BoundaryPurePursuit(Node):
         # recent past, keep using it instead of dropping to a single-side
         # offset path. This eats the BILATERAL ↔ single-side oscillation
         # that happens when a frame loses one boundary momentarily.
-        bilateral_hold_window = 0.3  # seconds
         if (path_to_follow is None
                 and len(self.last_good_midpoint) >= 2
                 and self.last_good_midpoint_time is not None):
             age = (self.get_clock().now()
                    - self.last_good_midpoint_time).nanoseconds * 1e-9
-            if age <= bilateral_hold_window and (L is not None or R is not None):
+            if age <= self.bilateral_hold_window and (L is not None or R is not None):
                 path_to_follow = self.last_good_midpoint
                 mode = "BILATERAL_HOLD"
 
@@ -1135,9 +1154,11 @@ class BoundaryPurePursuit(Node):
         m.scale.y = 0.10
         m.scale.z = 0.10
 
-        # green=BILATERAL, yellow=single-side, red=stale
+        # green=BILATERAL, cyan=BILATERAL_HOLD, yellow=SINGLE_LINE, red=STALE
         if mode == "BILATERAL":
             m.color.r, m.color.g, m.color.b = 0.0, 1.0, 0.0
+        elif mode == "BILATERAL_HOLD":
+            m.color.r, m.color.g, m.color.b = 0.0, 1.0, 1.0
         elif mode == "STALE":
             m.color.r, m.color.g, m.color.b = 1.0, 0.0, 0.0
         else:

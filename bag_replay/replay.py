@@ -29,25 +29,14 @@ from ros_shim import (
 import numpy as np
 import cv2
 
-# Camera y-offset (meters). The camera is mounted slightly off-center in the
-# car frame; this shifts every homography-projected point by Y_OFFSET in y
-# (REP-103: +y = left). Empirical sweep on this bag gave -0.18 m as the
-# value that aligns the controller's mean steering with the recorded mean.
-# Override with REPLAY_Y_OFFSET=<value>.
+# Use the new BoundaryPurePursuit `camera_y_offset` parameter (post-rebase)
+# instead of the previous monkey-patch on transform_uv_to_xy.
 Y_OFFSET = float(os.environ.get("REPLAY_Y_OFFSET", "-0.18"))
-
-import final_challenge.homography_transformer as _ht
-import final_challenge.lane_detector as _ld_mod
-_ORIG_TRANSFORM = _ht.transform_uv_to_xy
-def _shifted_uvxy(H, u, v):
-    x, y = _ORIG_TRANSFORM(H, u, v)
-    return x, y + Y_OFFSET
-_ht.transform_uv_to_xy = _shifted_uvxy
-_ld_mod.transform_uv_to_xy = _shifted_uvxy
 print(f"REPLAY_Y_OFFSET={Y_OFFSET:+.3f} m")
 
 from final_challenge.lane_detector import LaneDetector
 from final_challenge.lane_follower import BoundaryPurePursuit
+from sensor_msgs.msg import CompressedImage as _CompressedImage_t
 
 from bag_reader import iter_bag, bag_extents
 
@@ -77,27 +66,38 @@ DEBUG_TOPIC    = "/cone_debug_img"
 #              launch's assumed 1.0m). Speed adaptation and stale-stop are
 #              disabled so the synthesized speed stays at 3.5; half_width
 #              defaults reflect the actual measured geometry.
+# Deploy launch defaults (post-rebase: blob-only detector, CTE feedback,
+# camera_y_offset, smaller max_steering_angle).
 BASELINE_PARAMS = {
     "drive_topic":               "/drive",
-    "nominal_speed":             2.5,
+    "nominal_speed":             2.0,
     "half_width_init":           0.5,
-    "lookahead_distance":        1.2,
+    "camera_y_offset":           0.06,
+    "cte_gain":                  1.0,
+    "enable_visualization":      False,
+    "control_rate_hz":           20.0,
+    "bilateral_hold_window":     0.3,
+    "lookahead_distance":        1.68,
     "lost_line_lookahead_distance": 0.9,
     "min_lookahead_distance":    0.5,
     "lost_line_speed":           1.0,
-    "min_speed":                 0.6,
+    "min_speed":                 1.0,
     "max_speed":                 3.5,
     "curvature_speed_gain":      1.2,
     "curvature_lookahead_gain":  2.0,
     "stale_path_timeout":        0.75,
     "fresh_msg_timeout":         0.2,
-    "min_path_arc_length":       0.3,
+    "min_path_arc_length":       0.0,
     "stop_if_no_path":           True,
     "steering_alpha":            0.35,
-    "max_steering_angle":        0.40,
+    "max_steering_angle":        0.13,
     "target_alpha":              0.20,
 }
 
+# MATCH: drive at recorded constant 3.5 m/s, ride out camera dropouts, accept
+# the bag's apparent (narrower) lane geometry as bilateral, push max_steering
+# wide enough to cover the recorded -0.148 rad excursion, and run CTE feedback
+# soft so the controller doesn't over-correct relative to the recorded driver.
 MATCH_PARAMS = {
     **BASELINE_PARAMS,
     "nominal_speed":             3.5,
@@ -105,13 +105,27 @@ MATCH_PARAMS = {
     "max_speed":                 3.5,
     "curvature_speed_gain":      0.0,
     "lost_line_speed":           3.5,
-    "fresh_msg_timeout":         0.80,   # ride out the worst camera dropouts
+    "fresh_msg_timeout":         0.80,
     "stale_path_timeout":        1.50,
-    "stop_if_no_path":           False,  # do not emit zeros during gaps
+    "stop_if_no_path":           False,
     "half_width_init":           0.30,
     "half_width_min":            0.20,
     "half_width_max":            0.65,
+    "max_steering_angle":        0.20,
+    "camera_y_offset":           Y_OFFSET,
+    "cte_gain":                  0.0,           # off — recorded driver was smoother than CTE-pumped synth
+    "steering_alpha":            0.20,
+    "bilateral_hold_window":     1.5,           # stretch HOLD across short detector blackouts
+    "control_rate_hz":           float(os.environ.get("REPLAY_CONTROL_HZ", "20")),
 }
+
+# Override MIN_AREA via env var (bumps detector recall on this bag).
+# Default 500 = upstream (matches calibration GUI). 300 recovers ~3% more
+# both-line detections without producing meaningful extra noise.
+MIN_AREA_OVERRIDE = int(os.environ.get("REPLAY_MIN_AREA", "300"))
+import final_challenge.white_line_detection as _wld
+_wld.MIN_AREA = MIN_AREA_OVERRIDE
+print(f"REPLAY_MIN_AREA={MIN_AREA_OVERRIDE}")
 
 # Selected via env var REPLAY_MODE=baseline|match (default match).
 import os as _os
@@ -128,6 +142,36 @@ def make_image_msg(payload: Dict) -> _Image:
     m.step = int(payload["step"])
     m.data = payload["data"]
     m.is_bigendian = int(payload["is_bigendian"])
+    m.header.frame_id = payload["frame_id"]
+    m.header.stamp.sec = payload["stamp_sec"]
+    m.header.stamp.nanosec = payload["stamp_nsec"]
+    return m
+
+
+def make_compressed_image_msg(payload: Dict) -> _CompressedImage_t:
+    """Bag has raw bgra8/bgr8 frames; new lane_detector expects a
+    CompressedImage (it cv2.imdecode's the bytes). Convert once per frame."""
+    arr = payload["data"]
+    ch = {"bgr8": 3, "bgra8": 4, "rgb8": 3, "rgba8": 4}.get(payload["encoding"], 3)
+    h, w = int(payload["h"]), int(payload["w"])
+    if ch == 1:
+        bgr = arr.reshape(h, w)
+    else:
+        frame = arr.reshape(h, w, ch)
+        if payload["encoding"] == "bgra8":
+            bgr = frame[:, :, :3]
+        elif payload["encoding"] == "rgba8":
+            bgr = frame[:, :, [2, 1, 0]]
+        elif payload["encoding"] == "rgb8":
+            bgr = frame[:, :, ::-1]
+        else:
+            bgr = frame
+    ok, jpeg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        raise RuntimeError("JPEG encode failed")
+    m = _CompressedImage_t()
+    m.format = "jpeg"
+    m.data = jpeg.tobytes()
     m.header.frame_id = payload["frame_id"]
     m.header.stamp.sec = payload["stamp_sec"]
     m.header.stamp.nanosec = payload["stamp_nsec"]
@@ -163,13 +207,16 @@ def main() -> None:
 
     set_now_ns(t_start_ns)
     follower.control_timer.arm(t_start_ns)
+    print(f"control loop period: {follower.control_timer.period_sec*1000:.1f} ms "
+          f"({1.0/follower.control_timer.period_sec:.1f} Hz)")
 
     # Mode decoder from marker color
     def decode_mode(marker) -> str:
         r, g, b = marker.color.r, marker.color.g, marker.color.b
         if (r, g, b) == (0.0, 1.0, 0.0): return "BILATERAL"
+        if (r, g, b) == (0.0, 1.0, 1.0): return "BILATERAL_HOLD"
         if (r, g, b) == (1.0, 0.0, 0.0): return "STALE"
-        if (r, g, b) == (1.0, 1.0, 0.0): return "SINGLE_OR_HOLD"
+        if (r, g, b) == (1.0, 1.0, 0.0): return "SINGLE_LINE"
         return "UNK"
 
     def drain_one(ptopic, msg, pts):
@@ -206,7 +253,7 @@ def main() -> None:
 
         if topic == CAMERA_TOPIC:
             n_cam += 1
-            img_msg = make_image_msg(payload)
+            img_msg = make_compressed_image_msg(payload)
             try:
                 detector.image_callback(img_msg)
             except Exception as e:
@@ -403,6 +450,10 @@ def compute_summary(recorded, synth, detector_paths) -> str:
     lines.append("─" * 72)
     for mode, count in mc.most_common():
         lines.append(f"  {mode:18s} {count:5d}  ({100 * count / total:5.1f}%)")
+    eff = mc.get("BILATERAL", 0) + mc.get("BILATERAL_HOLD", 0)
+    lines.append(f"  ─────────────")
+    lines.append(f"  effective BILATERAL (incl. HOLD): "
+                 f"{eff:5d}  ({100 * eff / total:5.2f}%)")
     lines.append("")
 
     # Detection rates

@@ -7,3 +7,4 @@ __pycache__/
 
 # YOLO model weights (auto-downloaded by ultralytics)
 *.pt
+johnson_track_rosbag.zip

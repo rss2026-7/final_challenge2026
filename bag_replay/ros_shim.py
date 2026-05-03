@@ -225,13 +225,16 @@ class Node:
         self._on_param_cb = cb
 
     def create_subscription(self, msg_type: type, topic: str,
-                            callback: Callable[[Any], None], qos: Any) -> Subscription:
+                            callback: Callable[[Any], None], qos: Any,
+                            callback_group: Any = None) -> Subscription:
         return Subscription(msg_type, topic, callback, qos)
 
-    def create_publisher(self, msg_type: type, topic: str, qos: Any) -> Publisher:
+    def create_publisher(self, msg_type: type, topic: str, qos: Any,
+                         callback_group: Any = None) -> Publisher:
         return Publisher(msg_type, topic, qos)
 
-    def create_timer(self, period_sec: float, callback: Callable[[], None]) -> Timer:
+    def create_timer(self, period_sec: float, callback: Callable[[], None],
+                     callback_group: Any = None) -> Timer:
         return Timer(period_sec, callback)
 
     def destroy_node(self) -> None:
@@ -374,6 +377,12 @@ class _Image(_Msg):
         self.step = 0
         self.data = b""   # bytes OR np.ndarray
 
+class _CompressedImage(_Msg):
+    def __init__(self) -> None:
+        self.header = _Header()
+        self.format = ""   # e.g. "jpeg"
+        self.data = b""    # JPEG/PNG-encoded bytes
+
 class _RegionOfInterest(_Msg):
     def __init__(self) -> None:
         self.x_offset = 0; self.y_offset = 0
@@ -406,9 +415,29 @@ class _SetParametersResult(_Msg):
 class _DurabilityPolicy:
     VOLATILE = 1; TRANSIENT_LOCAL = 2
 
+class _ReliabilityPolicy:
+    SYSTEM_DEFAULT = 0; RELIABLE = 1; BEST_EFFORT = 2; UNKNOWN = 3
+
+class _HistoryPolicy:
+    SYSTEM_DEFAULT = 0; KEEP_LAST = 1; KEEP_ALL = 2; UNKNOWN = 3
+
 class _QoSProfile:
     def __init__(self, **kw: Any) -> None:
         self.__dict__.update(kw)
+
+
+# ── Executors / Callback groups (no-op for our single-threaded harness) ──
+class _MultiThreadedExecutor:
+    def __init__(self, *a: Any, **kw: Any) -> None: pass
+    def add_node(self, n: Any) -> None: pass
+    def spin(self) -> None: pass
+    def spin_once(self, timeout_sec: float = 0.0) -> None: pass
+    def shutdown(self) -> None: pass
+
+class _SingleThreadedExecutor(_MultiThreadedExecutor): pass
+
+class _MutuallyExclusiveCallbackGroup: pass
+class _ReentrantCallbackGroup: pass
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -501,7 +530,21 @@ def install() -> None:
     rclpy_qos = _mk("rclpy.qos")
     rclpy_qos.QoSProfile = _QoSProfile
     rclpy_qos.DurabilityPolicy = _DurabilityPolicy
+    rclpy_qos.QoSReliabilityPolicy = _ReliabilityPolicy
+    rclpy_qos.ReliabilityPolicy   = _ReliabilityPolicy
+    rclpy_qos.QoSHistoryPolicy    = _HistoryPolicy
+    rclpy_qos.HistoryPolicy       = _HistoryPolicy
     rclpy.qos = rclpy_qos
+
+    rclpy_exec = _mk("rclpy.executors")
+    rclpy_exec.MultiThreadedExecutor  = _MultiThreadedExecutor
+    rclpy_exec.SingleThreadedExecutor = _SingleThreadedExecutor
+    rclpy.executors = rclpy_exec
+
+    rclpy_cbg = _mk("rclpy.callback_groups")
+    rclpy_cbg.MutuallyExclusiveCallbackGroup = _MutuallyExclusiveCallbackGroup
+    rclpy_cbg.ReentrantCallbackGroup         = _ReentrantCallbackGroup
+    rclpy.callback_groups = rclpy_cbg
 
     rclpy_time = _mk("rclpy.time")
     rclpy_time.Time = Time
@@ -559,6 +602,7 @@ def install() -> None:
     sens = _mk("sensor_msgs")
     sens_msg = _mk("sensor_msgs.msg")
     sens_msg.Image = _Image
+    sens_msg.CompressedImage = _CompressedImage
     sens_msg.RegionOfInterest = _RegionOfInterest
     sens.msg = sens_msg
 

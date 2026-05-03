@@ -1,67 +1,67 @@
-"""Sweep camera-y offsets and report MAE-vs-recorded for each.
-
-Patches `transform_uv_to_xy` in lane_detector's namespace (where it was
-already pulled in via `from … import`) so both Hough and blob spine
-projections get the same offset applied uniformly.
-
-Use the MATCH parameter set otherwise. Speed is constant 3.5 — the only
-moving variable is steering, which is what we're trying to align.
-"""
+"""Sweep camera_y_offset values (post-rebase: this is now a real lane_follower
+parameter, no homography monkey-patching needed) and report MAE-vs-recorded
+for each. Speed is held constant 3.5 m/s — the only moving variable is
+steering, which is what we're aligning."""
 from __future__ import annotations
-import sys, os, importlib
+import sys, os
 sys.path.insert(0, "/tmp/rosbag_johnson")
 sys.path.insert(0, "/home/adhoc/Desktop/final_challenge2026")
 import ros_shim  # noqa
-from ros_shim import set_now_ns, set_param_overrides, _Image
+from ros_shim import set_now_ns, set_param_overrides
 import numpy as np
+import cv2
 
-# Import the modules we'll patch
-import final_challenge.homography_transformer as ht
-import final_challenge.lane_detector as ld_mod
+from final_challenge.lane_detector import LaneDetector
 from final_challenge.lane_follower import BoundaryPurePursuit
+from sensor_msgs.msg import CompressedImage as _CImsg
 
 from bag_reader import iter_bag, bag_extents
 
-ORIG_TRANSFORM = ht.transform_uv_to_xy
-Y_OFFSET = 0.0  # patched per run
+Y_OFFSET = 0.0  # set per run
 
-def shifted_uvxy(H, u, v):
-    x, y = ORIG_TRANSFORM(H, u, v)
-    return x, y + Y_OFFSET
-
-# Patch in BOTH places: the source module AND the binding lane_detector
-# already pulled in via `from … import transform_uv_to_xy`.
-ht.transform_uv_to_xy = shifted_uvxy
-ld_mod.transform_uv_to_xy = shifted_uvxy
-
-MATCH_PARAMS = {
+BASE_PARAMS = {
     "drive_topic": "/drive",
     "nominal_speed": 3.5, "min_speed": 3.5, "max_speed": 3.5,
     "curvature_speed_gain": 0.0, "lost_line_speed": 3.5,
     "fresh_msg_timeout": 0.80, "stale_path_timeout": 1.50,
     "stop_if_no_path": False,
     "half_width_init": 0.30, "half_width_min": 0.20, "half_width_max": 0.65,
-    "lookahead_distance": 1.2, "lost_line_lookahead_distance": 0.9,
+    "lookahead_distance": 1.68, "lost_line_lookahead_distance": 0.9,
     "min_lookahead_distance": 0.5, "curvature_lookahead_gain": 2.0,
-    "min_path_arc_length": 0.3,
-    "steering_alpha": 0.35, "max_steering_angle": 0.40,
+    "min_path_arc_length": 0.0,
+    "steering_alpha": 0.35, "max_steering_angle": 0.20,
     "target_alpha": 0.20, "half_width_alpha": 0.1,
+    "cte_gain": 0.5,
+    "enable_visualization": False,
 }
+
+
+def _to_jpeg(payload):
+    arr = payload["data"]
+    ch = {"bgr8": 3, "bgra8": 4}.get(payload["encoding"], 3)
+    h, w = payload["h"], payload["w"]
+    frame = arr.reshape(h, w, ch)
+    if ch == 4: frame = frame[:, :, :3]
+    ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    m = _CImsg()
+    m.format = "jpeg"; m.data = jpeg.tobytes()
+    m.header.stamp.sec = payload["stamp_sec"]; m.header.stamp.nanosec = payload["stamp_nsec"]
+    return m
 
 
 def run_one(y_off: float):
     global Y_OFFSET
     Y_OFFSET = y_off
 
-    set_param_overrides(MATCH_PARAMS)
-    # Wipe state from prior runs by clearing shim's pub/sub registries
+    params = dict(BASE_PARAMS); params["camera_y_offset"] = y_off
+    set_param_overrides(params)
     ros_shim.PUBLISH_LOG.clear()
     ros_shim.SUBSCRIPTIONS.clear()
     ros_shim.TIMERS.clear()
 
     t0, t_end = bag_extents()
     set_now_ns(t0)
-    det = ld_mod.LaneDetector()
+    det = LaneDetector()
     ppc = BoundaryPurePursuit()
     ppc.control_timer.arm(t0)
 
@@ -73,11 +73,7 @@ def run_one(y_off: float):
                 syn.append((pts, float(msg.drive.steering_angle)))
         set_now_ns(ts)
         if topic.endswith("rgb/image_rect_color"):
-            m = _Image()
-            m.height = p["h"]; m.width = p["w"]; m.encoding = p["encoding"]
-            m.step = p["step"]; m.data = p["data"]
-            m.header.stamp.sec = p["stamp_sec"]; m.header.stamp.nanosec = p["stamp_nsec"]
-            det.image_callback(m)
+            det.image_callback(_to_jpeg(p))
         elif topic.endswith("ackermann_cmd"):
             rec.append((ts, float(p["steering_angle"])))
         for ptopic, msg, pts in ros_shim.drain_publishes():
