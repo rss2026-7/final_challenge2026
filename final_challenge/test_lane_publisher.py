@@ -1,138 +1,93 @@
 #!/usr/bin/env python3
-"""
-Synthetic lane-line publisher for testing BoundaryPurePursuit.
+"""Synthetic /lookahead_point publisher for exercising LaneTracer offline.
 
-Publishes fake /left_lane_line and /right_lane_line Path messages
-so you can exercise the controller without real perception.
+Useful when you want to drive the controller without the full ZED + Hough
+pipeline.  The published point is whatever the selected mode dictates,
+emitted at a configurable rate.
 
 Usage:
     ros2 run final_challenge test_lane_publisher
+    ros2 run final_challenge test_lane_publisher --ros-args -p mode:=swerve
 
-Modes (set via --ros-args -p mode:=<mode>):
-    straight    – straight lane lines ahead
-    curve_left  – gentle left curve
-    curve_right – gentle right curve
-    dropout     – publishes for 2 s then stops for 1 s (repeating)
+Modes:
+    forward     – aim straight ahead (centred on the lane)
+    bend_left   – aim ahead-and-left
+    bend_right  – aim ahead-and-right
+    swerve      – sinusoidal y oscillation around centre
+    flicker     – publish for 2 s, then go silent for 1 s (perception drop)
 """
+from __future__ import annotations
 
 import math
 import time
-from typing import List, Tuple
 
 import rclpy
 from rclpy.node import Node
-from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped
+
+from geometry_msgs.msg import Point32
 
 
-def make_path_msg(points: List[Tuple[float, float]], stamp) -> Path:
-    msg = Path()
-    msg.header.stamp = stamp
-    msg.header.frame_id = "base_link"
-    for x, y in points:
-        ps = PoseStamped()
-        ps.header = msg.header
-        ps.pose.position.x = x
-        ps.pose.position.y = y
-        ps.pose.position.z = 0.0
-        ps.pose.orientation.w = 1.0
-        msg.poses.append(ps)
-    return msg
+class FakeAimEmitter(Node):
+    def __init__(self) -> None:
+        super().__init__("fake_aim_emitter")
 
+        self.declare_parameter("mode",         "forward")
+        self.declare_parameter("aim_x_m",      2.0)
+        self.declare_parameter("bend_y_m",     0.4)
+        self.declare_parameter("swerve_y_m",   0.3)
+        self.declare_parameter("swerve_hz",    0.5)
+        self.declare_parameter("publish_rate", 20.0)
 
-class TestLanePublisher(Node):
-    def __init__(self):
-        super().__init__("test_lane_publisher")
+        self._mode       = str(self.get_parameter("mode").value)
+        self._aim_x      = float(self.get_parameter("aim_x_m").value)
+        self._bend_y     = float(self.get_parameter("bend_y_m").value)
+        self._swerve_y   = float(self.get_parameter("swerve_y_m").value)
+        self._swerve_hz  = float(self.get_parameter("swerve_hz").value)
+        rate             = float(self.get_parameter("publish_rate").value)
 
-        self.declare_parameter("mode", "straight")
-        self.declare_parameter("lane_width", 0.6)       # meters between lines
-        self.declare_parameter("num_points", 30)
-        self.declare_parameter("point_spacing", 0.10)    # meters between points
-        self.declare_parameter("curve_radius", 3.0)      # meters (for curve modes)
-        self.declare_parameter("publish_rate", 20.0)     # Hz
-
-        self.mode = str(self.get_parameter("mode").value)
-        self.lane_width = float(self.get_parameter("lane_width").value)
-        self.num_points = int(self.get_parameter("num_points").value)
-        self.point_spacing = float(self.get_parameter("point_spacing").value)
-        self.curve_radius = float(self.get_parameter("curve_radius").value)
-        self.publish_rate = float(self.get_parameter("publish_rate").value)
-
-        self.left_pub = self.create_publisher(Path, "/left_lane_line", 10)
-        self.right_pub = self.create_publisher(Path, "/right_lane_line", 10)
-
-        period = 1.0 / self.publish_rate
-        self.timer = self.create_timer(period, self.publish_tick)
-        self.start_time = time.time()
+        self._pub = self.create_publisher(Point32, "/lookahead_point", 10)
+        self._timer = self.create_timer(1.0 / max(rate, 1.0), self._tick)
+        self._t0 = time.time()
 
         self.get_logger().info(
-            f"TestLanePublisher started  mode={self.mode}  "
-            f"lane_width={self.lane_width}  curve_radius={self.curve_radius}"
+            f"FakeAimEmitter up — mode={self._mode}, aim_x={self._aim_x:.2f}m, "
+            f"rate={rate:.1f} Hz"
         )
 
-    def publish_tick(self):
-        elapsed = time.time() - self.start_time
+    def _tick(self) -> None:
+        elapsed = time.time() - self._t0
 
-        # Dropout mode: publish 2 s on, 1 s off
-        if self.mode == "dropout":
+        if self._mode == "flicker":
             cycle = elapsed % 3.0
             if cycle > 2.0:
-                return  # simulate perception dropout
-
-        stamp = self.get_clock().now().to_msg()
-
-        left_pts, right_pts = self._generate_lane(self.mode)
-
-        self.left_pub.publish(make_path_msg(left_pts, stamp))
-        self.right_pub.publish(make_path_msg(right_pts, stamp))
-
-    def _generate_lane(self, mode: str):
-        half_w = self.lane_width / 2.0
-
-        if mode in ("straight", "dropout"):
-            left_pts = []
-            right_pts = []
-            for i in range(self.num_points):
-                x = 0.3 + i * self.point_spacing  # start 30 cm ahead
-                left_pts.append((x, half_w))
-                right_pts.append((x, -half_w))
-            return left_pts, right_pts
-
-        elif mode in ("curve_left", "curve_right"):
-            sign = 1.0 if mode == "curve_left" else -1.0
-            r = self.curve_radius
-            # Center of the turning circle
-            cx = 0.0
-            cy = sign * r
-
-            left_pts = []
-            right_pts = []
-            for i in range(self.num_points):
-                arc = (0.3 + i * self.point_spacing) / r
-                # Centerline point on the arc
-                mx = cx + r * math.sin(arc)
-                my = cy - sign * r * math.cos(arc)
-
-                # Tangent direction
-                tx = math.cos(arc)
-                ty = sign * math.sin(arc)
-
-                # Normal (pointing left of tangent)
-                nx = -ty
-                ny = tx
-
-                left_pts.append((mx + half_w * nx, my + half_w * ny))
-                right_pts.append((mx - half_w * nx, my - half_w * ny))
-            return left_pts, right_pts
-
+                return
+            x, y = self._aim_x, 0.0
+        elif self._mode == "forward":
+            x, y = self._aim_x, 0.0
+        elif self._mode == "bend_left":
+            x, y = self._aim_x, +self._bend_y
+        elif self._mode == "bend_right":
+            x, y = self._aim_x, -self._bend_y
+        elif self._mode == "swerve":
+            x = self._aim_x
+            y = self._swerve_y * math.sin(2.0 * math.pi * self._swerve_hz * elapsed)
         else:
-            self.get_logger().warn(f"Unknown mode '{mode}', defaulting to straight")
-            return self._generate_lane("straight")
+            self.get_logger().warn(
+                f"unknown mode '{self._mode}', falling back to 'forward'",
+                throttle_duration_sec=2.0,
+            )
+            x, y = self._aim_x, 0.0
+
+        msg = Point32()
+        msg.x = float(x)
+        msg.y = float(y)
+        msg.z = 0.0
+        self._pub.publish(msg)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = TestLanePublisher()
+    node = FakeAimEmitter()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

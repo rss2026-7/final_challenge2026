@@ -1,53 +1,35 @@
 <launch>
-  <!-- ═══════════════════════════════════════════════════════════════════
-       Lane-following on the real robot — Part A: The Great Snail Race
+  <!-- Real-robot lane following.
 
-       Run with:
+       The lane_tracer pure-pursuit defaults live inside lane_follower.py
+       (mirroring the 2025 racetrack reference: W=0.33 m, D=4.0/6.0/3.5 m,
+       v=4.1 m/s).  Only the environment-specific drive topic is overridden
+       here; everything else can be set on the CLI when needed.
+
+       Examples:
          ros2 launch final_challenge lane_follow_deploy.launch.xml
-
-       Controller is BoundaryPurePursuit (lane_follower.py):
-         midline = parabola fit through L/R lane samples → cross-track at
-         e_y_eval_x → P + arc-FF (gated on full bilateral coverage) →
-         EMA + slew + saturate.
-       Source defaults are the live-robot values; this launch file only
-       overrides what's strictly environment-specific (the VESC topic).
-       Other params can be overridden on the CLI:
          ros2 launch final_challenge lane_follow_deploy.launch.xml \
-              nominal_speed:=1.5 stop_if_no_path:=false
-       ═══════════════════════════════════════════════════════════════════ -->
+              cruise_speed_mps:=2.0 idle_when_blind:=false
+  -->
 
-  <!-- ── CLI-overridable args ──────────────────────────────────────── -->
-  <arg name="nominal_speed" default="2.0"
-       description="Target speed (m/s). 2.0 was chosen after run-20260503-060123
-                    showed catch-up distance at 3.5 m/s was 4.8× the lane
-                    half-width (structural under-damping). Raise once the
-                    controller's tracking is verified clean at this speed."/>
+  <arg name="cruise_speed_mps" default="4.1"
+       description="Forward speed (m/s)."/>
   <arg name="drive_topic" default="/vesc/low_level/input/navigation"
-       description="AckermannDriveStamped topic consumed by the VESC."/>
-  <arg name="stop_if_no_path" default="true"
-       description="If true, publish 0 m/s when no fresh path is available
-                    (also at startup before first BILATERAL fix). Prevents
-                    the start-of-run blind-drive that put the car one lane
-                    over in run-20260503-050721. Set false for graceful
-                    degradation during brief perception dropouts."/>
+       description="AckermannDriveStamped sink consumed by the VESC."/>
+  <arg name="idle_when_blind" default="true"
+       description="Stop the wheels (v=0) when no fresh boundary path is
+                    available — also at startup before the first detection."/>
 
-  <!-- ── ZED camera ────────────────────────────────────────────────── -->
   <include file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py">
     <arg name="camera_model" value="zed"/>
   </include>
 
-  <!-- ── Vision: white-line detection + homography ────────────────── -->
   <node pkg="final_challenge" exec="lane_detector" output="screen"/>
 
-  <!-- ── Control: parabola-fit lane follower ──────────────────────── -->
-  <!-- All other params (kp_lat=0.30, kd_lat=0.0, half_lane_width=0.425,
-       width_tol=0.20, camera_y_offset=-0.065, e_y_eval_x=1.5, etc.) are
-       declared with their measured/tuned defaults inside lane_follower.py.
-       Only environment-specific overrides are needed here. -->
   <node pkg="final_challenge" exec="boundary_pure_pursuit" output="screen">
     <param name="drive_topic"      value="$(var drive_topic)"/>
-    <param name="nominal_speed"    value="$(var nominal_speed)"/>
-    <param name="stop_if_no_path"  value="$(var stop_if_no_path)"/>
+    <param name="cruise_speed_mps" value="$(var cruise_speed_mps)"/>
+    <param name="idle_when_blind"  value="$(var idle_when_blind)"/>
   </node>
 
 </launch>
