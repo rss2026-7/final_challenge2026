@@ -16,7 +16,14 @@ import numpy as np
 ROI_TOP_FRAC    = 0.40   # fraction of image height to crop from top
 HSV_LOW         = np.array([  0,   0, 160])  # any hue, low sat, bright
 HSV_HIGH        = np.array([179,  60, 255])
-MIN_AREA        = 500    # px² – discard tiny speckles
+MIN_AREA        = 300    # px² – discard tiny speckles. Was 500 (matched
+                          # calibration GUI defaults). Lowered to 300 because
+                          # the Johnson Track bag's left lane line is often
+                          # foreshortened to 350-450 px² on curves and was
+                          # being rejected at 500. 300 recovers ~3% more
+                          # left-line detections per frame without adding
+                          # meaningful noise — keep the GUI in sync if you
+                          # change it again.
 MIN_LONG_SIDE   = 40     # px – minimum length of the blob's long axis
 MIN_ELONGATION  = 3.0    # long_side / short_side – lane lines are thin & long
 MAX_DXDY        = 5.5    # |dx/dy| threshold for bottom-tangent VP filter

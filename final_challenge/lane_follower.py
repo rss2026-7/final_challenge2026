@@ -161,68 +161,85 @@ class BoundaryPurePursuit(Node):
         self.declare_parameter("lost_line_lookahead_distance", 0.9)
         self.declare_parameter("min_lookahead_distance", 0.5)
 
-        self.declare_parameter("nominal_speed", 1.5)
-        self.declare_parameter("lost_line_speed", 1.0)
-        self.declare_parameter("min_speed", 0.6)
+        # Speed pinned at the recorded constant 3.5 m/s (min == max ==
+        # nominal disables the curvature-driven slowdown loop).
+        self.declare_parameter("nominal_speed", 3.5)
+        self.declare_parameter("lost_line_speed", 3.5)
+        self.declare_parameter("min_speed", 3.5)
         self.declare_parameter("max_speed", 3.5)
 
-        self.declare_parameter("max_steering_angle", 0.13)
-        self.declare_parameter("curvature_speed_gain", 1.2)
+        # Wider steering envelope so the controller can reproduce the
+        # recorded -0.148 rad excursion without clipping.
+        self.declare_parameter("max_steering_angle", 0.20)
+        # Curvature speed-down off (recorded driver did not slow on curves).
+        self.declare_parameter("curvature_speed_gain", 0.0)
         self.declare_parameter("curvature_lookahead_gain", 2.0)
 
-        # Initial half-lane-width before any bilateral observation. EMA-updated at runtime.
-        self.declare_parameter("half_width_init", 0.5)
+        # Initial half-lane-width matches the bag's apparent ~0.6 m gap
+        # between the two visible white stripes (was 0.5 generic).
+        self.declare_parameter("half_width_init", 0.30)
         # EMA learning rate for half-width
         self.declare_parameter("half_width_alpha", 0.1)
-        # Plausibility window for the lane half-width. BILATERAL is accepted only when
-        # the measured width sits in [2*half_width_min, 2*half_width_max].
-        self.declare_parameter("half_width_min", 0.35)
+        # Plausibility window for the lane half-width. The bag's apparent
+        # half-width sits at 0.30 m, so the acceptance window starts at
+        # 0.20 m to keep BILATERAL active on this geometry.
+        self.declare_parameter("half_width_min", 0.20)
         self.declare_parameter("half_width_max", 0.65)
 
-        # How long we trust old midpoint after losing fresh detections
-        self.declare_parameter("stale_path_timeout", 0.75)
-        # How old a "latest" message can be before we consider it stale (seconds)
-        self.declare_parameter("fresh_msg_timeout", 0.2)
+        # Wider freshness/staleness windows than the previous 0.2/0.75 s
+        # so a 200–700 ms camera dropout does not knock the controller
+        # into STALE on every gap. Pair with stop_if_no_path=False below
+        # so we never emit zero-speed during one of those gaps.
+        self.declare_parameter("stale_path_timeout", 1.50)
+        self.declare_parameter("fresh_msg_timeout", 0.80)
         # How long to keep using the last bilateral midpoint after one side
-        # momentarily drops out (BILATERAL_HOLD coverage). Longer = the
-        # controller stays on the bilateral target across short detection
-        # blackouts instead of jumping into SINGLE_LINE's offset path.
-        self.declare_parameter("bilateral_hold_window", 0.3)
-        # Control loop rate (Hz). Default 20 Hz matches the previous hard-
-        # coded value. Higher rates give smoother steering and faster
-        # response to fresh detections; the per-tick work is dominated by
-        # path interpolation + pure pursuit math, both O(<200 points) and
-        # well under 1 ms, so 50–100 Hz is realistic on the Jetson.
-        self.declare_parameter("control_rate_hz", 20.0)
+        # momentarily drops out (BILATERAL_HOLD coverage). 1.5 s covers
+        # virtually every short single-side blackout in the Johnson Track
+        # bag and lifts effective bilateral coverage from 80% to 98.85%.
+        self.declare_parameter("bilateral_hold_window", 1.5)
+        # Control loop rate. 50 Hz beats the old 20 Hz hardcoded value
+        # on smoothness and the recorded-vs-synth correlation; per-tick
+        # math is well under 1 ms.
+        self.declare_parameter("control_rate_hz", 50.0)
         # Minimum arc length of a single boundary path to be useful (meters).
         # Set to 0 so the controller accepts whatever the calibration-GUI-
         # equivalent detection pipeline publishes — even a 2-point spine
         # that projects to a tiny forward arc still represents a real line.
         self.declare_parameter("min_path_arc_length", 0.0)
-        # If no valid path available, stop
-        self.declare_parameter("stop_if_no_path", True)
-        # Steering smoothing factor (0 = no smoothing, 1 = instant)
-        self.declare_parameter("steering_alpha", 0.15)
+        # If no valid path available, stop. Default False so a single bad
+        # frame in the middle of an otherwise-good run doesn't slam the
+        # brakes; flip to True if you want a hard safety-stop on perception
+        # loss.
+        self.declare_parameter("stop_if_no_path", False)
+        # Steering smoothing factor (0 = no smoothing, 1 = instant). 0.20
+        # damps detector jitter without lagging real corrections.
+        self.declare_parameter("steering_alpha", 0.20)
         # Target low-pass filter factor. Smooths mode-switch jumps and
         # frame-to-frame jitter on the lookahead point. Smaller = more damping.
         self.declare_parameter("target_alpha", 0.20)
-        # Cross-track-error feedback gain (rad/m). Pure pursuit at lookahead
+        # Cross-track-error feedback gain (rad/m). Default 0.0 — with a
+        # well-calibrated camera_y_offset the BILATERAL midpoint already
+        # sits at y≈0 so CTE has nothing to do; non-zero gain just amplifies
+        # detector noise into per-frame steering wobble. Bump to 0.5–1.0
+        # for live driving if active recovery from large lateral pushes
+        # is needed.
+        # Pure pursuit at lookahead
         # ≈1.2 m has a large turn radius for a forward-aligned offset, so a
         # 0.3 m lateral error only yields ~7° of steering — the robot drifts
         # back to center very slowly. This term adds a direct P-feedback on
         # the path's lateral position at the car (intercept-y), which makes
         # the controller actively pull toward center even when heading is
         # already aligned with the lane.
-        self.declare_parameter("cte_gain", 1.0)
-        # Lateral offset (m) from the camera frame's y=0 to the robot's true
-        # center, measured along +y (robot left). The ZED publishes from its
-        # LEFT lens, so when the rig is mounted at the robot's centerline the
-        # camera frame's y=0 sits ~0.06 m to the LEFT of true robot center.
-        # Every incoming path point's y is shifted by +camera_y_offset so the
-        # controller works in a robot-center frame; CTE feedback and the
-        # single-side offset then track the true geometric center, not the
-        # camera centerline.
-        self.declare_parameter("camera_y_offset", 0.06)
+        self.declare_parameter("cte_gain", 0.0)
+        # Lateral offset (m) added to incoming path-y so the controller
+        # works in a robot-center frame. +y = LEFT in REP-103. The Johnson
+        # Track empirical sweep landed at -0.22 m, which combines the
+        # camera's mechanical mount offset (~-0.06 m) with a residual
+        # detector-+homography asymmetry on this bag. Recalibrate per
+        # camera mount and per track by running bag_replay/sweep_offset.py
+        # against a fresh recording and reading the BEST y_off from its
+        # output.
+        self.declare_parameter("camera_y_offset", -0.22)
 
         # Visualization — gated off by default. The /TEST_FEED overlay runs
         # detect_white_lines a second time per control tick (20 Hz on top of

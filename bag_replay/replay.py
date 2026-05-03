@@ -98,34 +98,34 @@ BASELINE_PARAMS = {
 # the bag's apparent (narrower) lane geometry as bilateral, push max_steering
 # wide enough to cover the recorded -0.148 rad excursion, and run CTE feedback
 # soft so the controller doesn't over-correct relative to the recorded driver.
+# MATCH = empty: rely entirely on the lane_follower's declare_parameter
+# defaults (which were updated in the same commit as this comment). The
+# only override left is camera_y_offset, because that's a per-camera-mount
+# config and the most plausible thing to want to tune from the CLI.
+# Set REPLAY_USE_MATCH_OVERRIDES=1 to force the historical overrides for
+# A/B testing.
 MATCH_PARAMS = {
-    **BASELINE_PARAMS,
-    "nominal_speed":             3.5,
-    "min_speed":                 3.5,
-    "max_speed":                 3.5,
-    "curvature_speed_gain":      0.0,
-    "lost_line_speed":           3.5,
-    "fresh_msg_timeout":         0.80,
-    "stale_path_timeout":        1.50,
-    "stop_if_no_path":           False,
-    "half_width_init":           0.30,
-    "half_width_min":            0.20,
-    "half_width_max":            0.65,
-    "max_steering_angle":        0.20,
-    "camera_y_offset":           Y_OFFSET,
-    "cte_gain":                  0.0,           # off — recorded driver was smoother than CTE-pumped synth
-    "steering_alpha":            0.20,
-    "bilateral_hold_window":     1.5,           # stretch HOLD across short detector blackouts
-    "control_rate_hz":           float(os.environ.get("REPLAY_CONTROL_HZ", "20")),
+    "drive_topic": "/drive",
+    "camera_y_offset": Y_OFFSET,
 }
+if os.environ.get("REPLAY_USE_MATCH_OVERRIDES", "0") == "1":
+    MATCH_PARAMS.update({
+        "nominal_speed": 3.5, "min_speed": 3.5, "max_speed": 3.5,
+        "lost_line_speed": 3.5, "curvature_speed_gain": 0.0,
+        "fresh_msg_timeout": 0.80, "stale_path_timeout": 1.50,
+        "stop_if_no_path": False,
+        "half_width_init": 0.30, "half_width_min": 0.20, "half_width_max": 0.65,
+        "max_steering_angle": 0.20, "steering_alpha": 0.20,
+        "cte_gain": 0.0, "bilateral_hold_window": 1.5,
+        "control_rate_hz": float(os.environ.get("REPLAY_CONTROL_HZ", "50")),
+    })
 
-# Override MIN_AREA via env var (bumps detector recall on this bag).
-# Default 500 = upstream (matches calibration GUI). 300 recovers ~3% more
-# both-line detections without producing meaningful extra noise.
-MIN_AREA_OVERRIDE = int(os.environ.get("REPLAY_MIN_AREA", "300"))
-import final_challenge.white_line_detection as _wld
-_wld.MIN_AREA = MIN_AREA_OVERRIDE
-print(f"REPLAY_MIN_AREA={MIN_AREA_OVERRIDE}")
+# Optional MIN_AREA override (kept as an env var so the bag harness can
+# A/B test back to upstream's 500). Default = whatever the module ships.
+if "REPLAY_MIN_AREA" in os.environ:
+    import final_challenge.white_line_detection as _wld
+    _wld.MIN_AREA = int(os.environ["REPLAY_MIN_AREA"])
+    print(f"REPLAY_MIN_AREA={_wld.MIN_AREA}")
 
 # Selected via env var REPLAY_MODE=baseline|match (default match).
 import os as _os
