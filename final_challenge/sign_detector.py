@@ -78,6 +78,7 @@ class SignDetectorNode(Node):
 
         self.result_pub = self.create_publisher(String, "/sign_detection/result", 10)
         self.annotated_pub = self.create_publisher(Image, "/sign_detection/annotated_image", 10)
+        self.live_feed_pub = self.create_publisher(Image, "/sign_detection/live_feed", 10)
         self.cone_px_pub = self.create_publisher(ConeLocationPixel, "/relative_cone_px", 10)
 
         self.get_logger().info(
@@ -89,7 +90,6 @@ class SignDetectorNode(Node):
     def _trigger_cb(self, msg: Bool) -> None:
         if msg.data:
             self.active = True
-            self.result_published = False
             self.get_logger().info("Detection triggered.")
         else:
             self.active = False
@@ -119,6 +119,13 @@ class SignDetectorNode(Node):
             return
 
         dets = self._results_to_detections(results[0])
+
+        # Always publish live feed with all detections drawn
+        live = self._draw_all_detections(bgr, dets)
+        live_msg = self.bridge.cv2_to_imgmsg(live, encoding="bgr8")
+        live_msg.header = msg.header
+        self.live_feed_pub.publish(live_msg)
+
         if not dets:
             return
 
@@ -185,6 +192,16 @@ class SignDetectorNode(Node):
         label = f"{det.class_name} {det.confidence:.2f}"
         cv2.putText(out, label, (det.x1, det.y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        return out
+
+    def _draw_all_detections(self, bgr: np.ndarray, dets: List[Detection]) -> np.ndarray:
+        out = bgr.copy()
+        for det in dets:
+            color = CLASS_COLORS.get(det.class_name, (255, 255, 255))
+            cv2.rectangle(out, (det.x1, det.y1), (det.x2, det.y2), color, 2)
+            label = f"{det.class_name} {det.confidence:.2f}"
+            cv2.putText(out, label, (det.x1, det.y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         return out
 
 
