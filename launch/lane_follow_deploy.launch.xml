@@ -6,7 +6,7 @@
        Defaults below were calibrated against the Johnson Track rosbag
        (`bag_replay/`); replaying this launch's parameter set through the
        lane_follower reproduces the recorded /vesc/.../ackermann_cmd to
-       within 1.81° steering MAE (~0° bias) at 50 Hz with 98.85% effective
+       within 0.83° steering MAE (~0° bias) at 50 Hz with 98.85% effective
        BILATERAL coverage. Each parameter's value below is the one that
        moved the synth-vs-recorded comparison; a comment marks where the
        value diverges from the previous "race-day generic" default and why.
@@ -22,17 +22,16 @@
                     with curvature_speed_gain=0 below for a flat trace."/>
   <arg name="drive_topic"   default="/vesc/low_level/input/navigation"
        description="AckermannDriveStamped topic consumed by the VESC"/>
-  <arg name="camera_y_offset" default="-0.22"
+  <arg name="camera_y_offset" default="-0.28"
        description="Lateral offset (m) added to incoming path-y so the
                     controller works in a robot-center frame. Sign convention:
-                    +y = LEFT of robot in REP-103. The empirical sweep on the
-                    Johnson Track bag chose -0.22 m as the value that zeros
-                    the median synth-vs-recorded steering bias; it bundles
-                    the camera's mechanical mounting offset (~-0.06 m) with
-                    a residual asymmetry from inner-stripe selection +
-                    homography drift. Recalibrate per camera mount/track:
-                    run bag_replay/sweep_offset.py against a fresh bag and
-                    take the BEST y_off."/>
+                    +y = LEFT of robot in REP-103. The Johnson Track sweep
+                    landed at -0.28 m for the long-lookahead configuration
+                    below; it bundles the camera's mechanical mounting offset
+                    (~-0.06 m) with a residual detector + homography
+                    asymmetry on this bag. Recalibrate per camera mount/track:
+                    run bag_replay/sweep_offset.py against a fresh recording
+                    and take the BEST y_off."/>
   <arg name="cte_gain" default="0.0"
        description="Cross-track-error feedback gain (rad/m). The recorded
                     driver was much smoother than CTE-pumped synth (CTE
@@ -59,8 +58,13 @@
     <param name="cte_gain"            value="$(var cte_gain)"/>
     <param name="enable_visualization" value="false"/>
 
-    <!-- Lookahead distances (metres) -->
-    <param name="lookahead_distance"           value="1.68"/>
+    <!-- Lookahead distances (metres). 4.5 m looks well past the per-frame
+         detector wobble: pure pursuit averages noise over the sample
+         range, so a long lookahead is itself a low-pass on the steering
+         output. Halves the steering MAE on this bag vs the older 1.68 m.
+         The curvature-adaptive lookahead floors at min_lookahead_distance
+         on tight turns. -->
+    <param name="lookahead_distance"           value="4.5"/>
     <param name="lost_line_lookahead_distance" value="0.9"/>
     <param name="min_lookahead_distance"       value="0.5"/>
 
@@ -97,11 +101,13 @@
     <param name="half_width_min"      value="0.20"/>
     <param name="half_width_max"      value="0.65"/>
 
-    <!-- Steering shaping. Lower steering_alpha (more smoothing) and a
-         wider max_steering_angle so the synth can match the recorded
-         -0.148 rad excursion without clipping. -->
-    <param name="steering_alpha"      value="0.20"/>
-    <param name="max_steering_angle"  value="0.20"/>
+    <!-- Steering shaping. With long lookahead doing most of the work, a
+         very heavy EMA (0.05) on the output kills any leftover spike.
+         max_steering_angle 0.15 sits just above the recorded driver's
+         peak excursion (-0.148 rad) so legitimate corrections aren't
+         clipped but pure-pursuit overshoots are. -->
+    <param name="steering_alpha"      value="0.05"/>
+    <param name="max_steering_angle"  value="0.15"/>
     <param name="target_alpha"        value="0.20"/>
 
     <!-- Control loop rate. 50 Hz is the new default — per-tick math is

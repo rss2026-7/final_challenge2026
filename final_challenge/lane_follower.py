@@ -157,7 +157,13 @@ class BoundaryPurePursuit(Node):
         self.declare_parameter("drive_topic", "/drive")
 
         self.declare_parameter("wheelbase", 0.33)
-        self.declare_parameter("lookahead_distance", 1.68)
+        # Bigger lookahead = effectively a low-pass on detector noise: pure
+        # pursuit at long range averages out per-frame stripe wobble. The
+        # Johnson Track sweep landed at 4.5 m, which halves the steering
+        # MAE vs the previous 1.68 m on this bag (1.81° → 0.83°). On real
+        # tight curves you may want to dial this back; the curvature-
+        # adaptive lookahead floor is `min_lookahead_distance`.
+        self.declare_parameter("lookahead_distance", 4.5)
         self.declare_parameter("lost_line_lookahead_distance", 0.9)
         self.declare_parameter("min_lookahead_distance", 0.5)
 
@@ -168,9 +174,12 @@ class BoundaryPurePursuit(Node):
         self.declare_parameter("min_speed", 3.5)
         self.declare_parameter("max_speed", 3.5)
 
-        # Wider steering envelope so the controller can reproduce the
-        # recorded -0.148 rad excursion without clipping.
-        self.declare_parameter("max_steering_angle", 0.20)
+        # Steering envelope sized to recorded driver's range
+        # ([-0.148, +0.082] rad). A bit of headroom (0.15 ≈ 8.6°) lets
+        # legitimate excursions through but clips the per-frame spikes
+        # that detector noise + pure pursuit would otherwise produce
+        # at ±0.20.
+        self.declare_parameter("max_steering_angle", 0.15)
         # Curvature speed-down off (recorded driver did not slow on curves).
         self.declare_parameter("curvature_speed_gain", 0.0)
         self.declare_parameter("curvature_lookahead_gain", 2.0)
@@ -211,9 +220,13 @@ class BoundaryPurePursuit(Node):
         # brakes; flip to True if you want a hard safety-stop on perception
         # loss.
         self.declare_parameter("stop_if_no_path", False)
-        # Steering smoothing factor (0 = no smoothing, 1 = instant). 0.20
-        # damps detector jitter without lagging real corrections.
-        self.declare_parameter("steering_alpha", 0.20)
+        # Steering smoothing factor (0 = no smoothing, 1 = instant). 0.05
+        # is a heavy EMA: each tick mixes 5% of the freshly-computed
+        # command with 95% of the previous output. Pairs with the long
+        # lookahead — both kill the high-frequency jitter that detector
+        # noise injects through pure pursuit. Bring this back up to ~0.20
+        # if the controller feels too sluggish on real corrections.
+        self.declare_parameter("steering_alpha", 0.05)
         # Target low-pass filter factor. Smooths mode-switch jumps and
         # frame-to-frame jitter on the lookahead point. Smaller = more damping.
         self.declare_parameter("target_alpha", 0.20)
@@ -233,13 +246,13 @@ class BoundaryPurePursuit(Node):
         self.declare_parameter("cte_gain", 0.0)
         # Lateral offset (m) added to incoming path-y so the controller
         # works in a robot-center frame. +y = LEFT in REP-103. The Johnson
-        # Track empirical sweep landed at -0.22 m, which combines the
-        # camera's mechanical mount offset (~-0.06 m) with a residual
-        # detector-+homography asymmetry on this bag. Recalibrate per
-        # camera mount and per track by running bag_replay/sweep_offset.py
-        # against a fresh recording and reading the BEST y_off from its
-        # output.
-        self.declare_parameter("camera_y_offset", -0.22)
+        # Track empirical sweep landed at -0.28 m for the long-lookahead
+        # configuration above (-0.22 m for the older 1.68 m lookahead).
+        # The number bundles the camera's mechanical mount offset
+        # (~-0.06 m) with a residual detector + homography asymmetry on
+        # this bag. Recalibrate per camera mount and per track by running
+        # bag_replay/sweep_offset.py against a fresh recording.
+        self.declare_parameter("camera_y_offset", -0.28)
 
         # Visualization — gated off by default. The /TEST_FEED overlay runs
         # detect_white_lines a second time per control tick (20 Hz on top of
