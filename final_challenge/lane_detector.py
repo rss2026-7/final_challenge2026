@@ -281,6 +281,7 @@ class LaneDetector(Node):
         self.declare_parameter("fit_x_max", 2.3)
         self.declare_parameter("fit_n_samples", 11)
         self.declare_parameter("half_lane_width", 0.425)
+        self.declare_parameter("width_tol", 0.20)
         self.declare_parameter("camera_y_offset", -0.065)
         self.declare_parameter("wheelbase", 0.32)
         self.e_y_eval_x = float(self.get_parameter("e_y_eval_x").value)
@@ -288,6 +289,7 @@ class LaneDetector(Node):
         self.fit_x_max = float(self.get_parameter("fit_x_max").value)
         self.fit_n_samples = int(self.get_parameter("fit_n_samples").value)
         self.half_lane_width = float(self.get_parameter("half_lane_width").value)
+        self.width_tol = float(self.get_parameter("width_tol").value)
         self.camera_y_offset = float(self.get_parameter("camera_y_offset").value)
         self.wheelbase = float(self.get_parameter("wheelbase").value)
 
@@ -420,12 +422,24 @@ class LaneDetector(Node):
         midline = []
         n_bi = n_single = 0
         hw = self.half_lane_width
+        full_width = 2.0 * hw
+        tol = self.width_tol
+        prefer_left = (
+            len(L) >= 2 and len(R) >= 2 and len(L) >= len(R)
+        ) or (len(L) >= 2 and len(R) < 2)
         for x in xs:
             yl = self._interp_y_at_x(L, float(x)) if len(L) >= 2 else None
             yr = self._interp_y_at_x(R, float(x)) if len(R) >= 2 else None
             if yl is not None and yr is not None:
-                midline.append((float(x), 0.5 * (yl + yr)))
-                n_bi += 1
+                if abs((yl - yr) - full_width) <= tol:
+                    midline.append((float(x), 0.5 * (yl + yr)))
+                    n_bi += 1
+                else:
+                    if prefer_left:
+                        midline.append((float(x), yl - hw))
+                    else:
+                        midline.append((float(x), yr + hw))
+                    n_single += 1
             elif yl is not None:
                 midline.append((float(x), yl - hw))
                 n_single += 1

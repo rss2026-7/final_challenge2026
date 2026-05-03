@@ -173,6 +173,15 @@ class BoundaryPurePursuit(Node):
         # Half-lane width used to synthesise the missing side.
         # Track lane is 85 cm wide → half = 0.425 m (measured).
         self.declare_parameter("half_lane_width", 0.425)
+        # Width-consistency gate. A BILATERAL pair is only accepted if
+        # |y_L − y_R| is within `width_tol` of `2·half_lane_width`. On
+        # the failing run-20260503-060123, BI pairs frequently bracketed
+        # *different lanes* (implied L–R separation up to 2.25 m vs the
+        # 0.85 m measured). On reject, the controller falls back to
+        # single-side synthesis using whichever side has more raw
+        # detected points at that x (proxied by left_n vs right_n at
+        # the tick level). 0.20 m tolerance ≈ ±23 % of true width.
+        self.declare_parameter("width_tol", 0.20)
         # Lateral offset added to incoming path y so the controller works
         # in a robot-center frame. Camera is 6.5 cm to the left of the
         # rear axle (measured) → -0.065.
@@ -192,7 +201,13 @@ class BoundaryPurePursuit(Node):
         # phase-lead/derivative content the recorded driver shows on
         # turn-in. Tuned empirically against the bag.
         self.declare_parameter("kp_lat", 0.30)
-        self.declare_parameter("kd_lat", 0.15)
+        # Kd_lat=0: tuning trace run-20260503-060123 showed the D-term
+        # contributing 91.8 % of σ²(δ_raw) by amplifying perception
+        # jitter (|d_e_y| up to 50 m/s — physically impossible at v=3.5).
+        # Σ|δ_D|/Σ|δ_P| = 2.47×; replay with Kd=0 cuts σ(δ_final) by
+        # 17 %, slew-clip rate from 22 % → 3.5 %. Re-enable only after
+        # smoothing the e_y signal it differentiates.
+        self.declare_parameter("kd_lat", 0.0)
         # Cap on |κ| AFTER smoothing. Parabola-fit curvature on near-
         # collinear data is dominated by detector noise; clamp tightly
         # so the FF only contributes a small slow component.
@@ -216,7 +231,12 @@ class BoundaryPurePursuit(Node):
         self.declare_parameter("max_steering_angle", 0.34)
 
         # ── speed (constant) ────────────────────────────────────────────
-        self.declare_parameter("nominal_speed", 3.5)
+        # 2.0 m/s: at 3.5 m/s the controller's catch-up distance was
+        # 4.8× the lane half-width (structural under-damping). Halving
+        # v doubles the preview budget per meter and quarters lateral
+        # acceleration at the same δ. Restore to 3.5 once oscillation
+        # is shown to be tame at this speed.
+        self.declare_parameter("nominal_speed", 2.0)
 
         # ── control loop rate ───────────────────────────────────────────
         # Recorded driver published at 33.5 Hz (2× the 14.7 Hz camera).
@@ -320,6 +340,7 @@ class BoundaryPurePursuit(Node):
             "t", "tick", "dt",
             "left_stamp_ns", "right_stamp_ns",
             "mode", "mode_changed", "n_pts", "n_bi", "n_single",
+            "n_width_rejected",
             "left_n", "left_xmax", "left_age",
             "right_n", "right_xmax", "right_age",
             "fit_a", "fit_b", "fit_c", "slope",
@@ -368,6 +389,7 @@ class BoundaryPurePursuit(Node):
         self.fit_x_max = float(gp("fit_x_max").value)
         self.fit_n_samples = int(gp("fit_n_samples").value)
         self.half_lane_width = float(gp("half_lane_width").value)
+        self.width_tol = float(gp("width_tol").value)
         self.camera_y_offset = float(gp("camera_y_offset").value)
         self.e_y_eval_x = float(gp("e_y_eval_x").value)
         self.marker_x = float(gp("marker_x").value)
@@ -390,7 +412,7 @@ class BoundaryPurePursuit(Node):
     def _on_param_change(self, params) -> SetParametersResult:
         float_params = {
             "wheelbase", "fit_x_min", "fit_x_max",
-            "half_lane_width", "camera_y_offset",
+            "half_lane_width", "width_tol", "camera_y_offset",
             "e_y_eval_x", "marker_x", "kp_lat", "kd_lat",
             "max_curvature", "kappa_alpha",
             "steering_alpha", "max_steering_rate", "max_steering_angle",
@@ -454,31 +476,54 @@ class BoundaryPurePursuit(Node):
 
     # ── midline construction ──────────────────────────────────────────
     def _build_midline_samples(self) -> Tuple[
-            List[Tuple[float, float]], str, int, int]:
+            List[Tuple[float, float]], str, int, int, int]:
         """Sample the midline at fit_n_samples evenly-spaced x's in
         [fit_x_min, fit_x_max].
 
-        Bilateral: average y_left and y_right at each x. Single-side:
-        offset the available boundary by ±half_lane_width. Skip x's where
-        neither side interpolates.
+        Bilateral: average y_left and y_right at each x — but ONLY if
+        |y_left − y_right| is within `width_tol` of `2·half_lane_width`.
+        On the failing run the perception was bracketing different
+        physical lanes (implied separation up to 2.25 m vs measured
+        0.85 m); polyfit absorbed the geometric inconsistency as fake
+        curvature. The width gate refuses such pairs and falls back to
+        single-side synthesis on whichever side has more raw points.
 
-        Returns (pts, mode, n_bilateral, n_single). The mode is the
-        dominant kind for this tick (drives the marker color)."""
+        Single-side: offset the available boundary by ±half_lane_width.
+        Skip x's where neither side interpolates.
+
+        Returns (pts, mode, n_bilateral, n_single, n_width_rejected)."""
         L = self._fresh("left")
         R = self._fresh("right")
         pts: List[Tuple[float, float]] = []
-        n_bi = n_single = 0
+        n_bi = n_single = n_width_reject = 0
         if L is None and R is None:
-            return pts, "STALE", 0, 0
+            return pts, "STALE", 0, 0, 0
         n = max(2, int(self.fit_n_samples))
         xs = np.linspace(self.fit_x_min, self.fit_x_max, n)
         hw = self.half_lane_width
+        full_width = 2.0 * hw
+        tol = self.width_tol
+        # When we have to fall back to single-side on a width-rejected
+        # pair, prefer whichever side has more raw detected points
+        # globally for this tick. (Per-x density is unavailable.)
+        prefer_left = (
+            L is not None and R is not None and len(L) >= len(R)
+        ) or (L is not None and R is None)
         for x in xs:
             yl = interp_y_at_x(L, float(x)) if L is not None else None
             yr = interp_y_at_x(R, float(x)) if R is not None else None
             if yl is not None and yr is not None:
-                pts.append((float(x), 0.5 * (yl + yr)))
-                n_bi += 1
+                if abs((yl - yr) - full_width) <= tol:
+                    pts.append((float(x), 0.5 * (yl + yr)))
+                    n_bi += 1
+                else:
+                    # width-inconsistent pair → fall back to single-side
+                    n_width_reject += 1
+                    if prefer_left:
+                        pts.append((float(x), yl - hw))
+                    else:
+                        pts.append((float(x), yr + hw))
+                    n_single += 1
             elif yl is not None:
                 pts.append((float(x), yl - hw))
                 n_single += 1
@@ -486,9 +531,9 @@ class BoundaryPurePursuit(Node):
                 pts.append((float(x), yr + hw))
                 n_single += 1
         if not pts:
-            return pts, "STALE", 0, 0
+            return pts, "STALE", 0, 0, n_width_reject
         mode = "BILATERAL" if n_bi >= max(1, n_single) else "SINGLE_LINE"
-        return pts, mode, n_bi, n_single
+        return pts, mode, n_bi, n_single, n_width_reject
 
     # ── control loop ───────────────────────────────────────────────────
     def control_loop(self) -> None:
@@ -501,7 +546,7 @@ class BoundaryPurePursuit(Node):
         else:
             dt_tick = max((now_ns - self.prev_time_ns) * 1e-9, 1e-3)
 
-        pts, mode, n_bi, n_single = self._build_midline_samples()
+        pts, mode, n_bi, n_single, n_width_reject = self._build_midline_samples()
         if mode == "BILATERAL":
             self._seen_bilateral = True
         gate_wait_bi = (mode == "SINGLE_LINE" and not self._seen_bilateral)
@@ -531,6 +576,7 @@ class BoundaryPurePursuit(Node):
             "right_stamp_ns": self.latest_right_stamp_ns,
             "mode": mode, "mode_changed": mode_changed,
             "n_pts": len(pts), "n_bi": n_bi, "n_single": n_single,
+            "n_width_rejected": n_width_reject,
             "left_n": len(L), "left_xmax": left_xmax, "left_age": left_age,
             "right_n": len(R), "right_xmax": right_xmax, "right_age": right_age,
             "fit_a": float("nan"), "fit_b": float("nan"), "fit_c": float("nan"),
@@ -686,6 +732,7 @@ class BoundaryPurePursuit(Node):
                 dbg["left_stamp_ns"], dbg["right_stamp_ns"],
                 dbg["mode"], int(bool(dbg["mode_changed"])),
                 dbg["n_pts"], dbg["n_bi"], dbg["n_single"],
+                dbg["n_width_rejected"],
                 dbg["left_n"], dbg["left_xmax"], dbg["left_age"],
                 dbg["right_n"], dbg["right_xmax"], dbg["right_age"],
                 dbg["fit_a"], dbg["fit_b"], dbg["fit_c"], dbg["slope"],
