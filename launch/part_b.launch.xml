@@ -44,6 +44,11 @@
     <param name="model" value="/home/racecar/racecar_ws/yolo11n.pt"/>
   </node>
 
+
+  <!-- ── Traffic light detector ── -->
+  <node pkg="final_challenge" exec="stoplight_detection" output="screen">
+  </node>
+
   <!-- ── Homography transformer: /relative_cone_px → /relative_cone ─── -->
   <node pkg="final_challenge" exec="homography_transformer" output="screen"/>
 
