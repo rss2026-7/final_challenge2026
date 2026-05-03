@@ -218,7 +218,7 @@ launch file becomes more valuable to start everything cleanly in one shot.
 | `/vesc/ackermann_cmd` | pub | Stop commands (real robot) |
 | `/drive` | pub | Stop commands (sim only, pass via --ros-args) |
 | `/sign_detection/trigger` | pub | trigger YOLO detection (sign_detector node) |
-| `/sign_detection/result` | sub | detected object class — "parking_meter", "fire_hydrant", or "bird" |
+| `/sign_detection/result` | sub | detected object class — "parking meter", "fire hydrant", "traffic light", or "person" |
 | `/parking/trigger` | pub | [KEVIN] start parking controller |
 | `/parking/done` | sub | [KEVIN] parking complete signal |
 

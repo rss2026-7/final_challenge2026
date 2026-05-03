@@ -17,7 +17,7 @@ python3 final_challenge/yolo_node.py --ros-args \
     -p conf_threshold:=0.5
 ```
 
-Target classes are hard-coded: `parking_meter`, `fire_hydrant`, `bird`, `traffic light`.
+Target classes are hard-coded (Ultralytics COCO labels): `parking meter`, `fire hydrant`, `traffic light`, `person`. ROS topic names replace spaces with underscores, so `/yolo/parking_meter/roi` etc.
 
 ### Inputs
 
@@ -34,8 +34,8 @@ Target classes are hard-coded: `parking_meter`, `fire_hydrant`, `bird`, `traffic
 |---|---|---|
 | `/yolo/parking_meter/roi` | `sensor_msgs/RegionOfInterest` | Highest-conf bbox; `width==0 && height==0` ⇒ not detected this frame |
 | `/yolo/fire_hydrant/roi` | `sensor_msgs/RegionOfInterest` | same |
-| `/yolo/bird/roi` | `sensor_msgs/RegionOfInterest` | same |
 | `/yolo/traffic_light/roi` | `sensor_msgs/RegionOfInterest` | same (note `_` not space) |
+| `/yolo/person/roi` | `sensor_msgs/RegionOfInterest` | same |
 | `/yolo/annotated_image` | `sensor_msgs/Image` | Input frame with all surviving boxes drawn |
 
 ---
