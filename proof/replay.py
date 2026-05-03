@@ -35,7 +35,7 @@ import cv2
 
 # Use the new BoundaryPurePursuit `camera_y_offset` parameter (post-rebase)
 # instead of the previous monkey-patch on transform_uv_to_xy.
-Y_OFFSET = float(os.environ.get("REPLAY_Y_OFFSET", "-0.28"))
+Y_OFFSET = float(os.environ.get("REPLAY_Y_OFFSET", "-0.32"))
 print(f"REPLAY_Y_OFFSET={Y_OFFSET:+.3f} m")
 
 from final_challenge.lane_detector import LaneDetector

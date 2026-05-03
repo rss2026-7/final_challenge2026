@@ -3,13 +3,14 @@
        Lane-following on the real robot — Part A: The Great Snail Race
        ═══════════════════════════════════════════════════════════════════
 
-       Defaults below were calibrated against the Johnson Track rosbag
-       (`bag_replay/`); replaying this launch's parameter set through the
-       lane_follower reproduces the recorded /vesc/.../ackermann_cmd to
-       within 0.83° steering MAE (~0° bias) at 50 Hz with 98.85% effective
-       BILATERAL coverage. Each parameter's value below is the one that
-       moved the synth-vs-recorded comparison; a comment marks where the
-       value diverges from the previous "race-day generic" default and why.
+       BoundaryPurePursuit was rewritten as a parking-controller-style PD
+       on a fake-cone target (lane midpoint at a fixed forward distance).
+       The previous pure-pursuit-with-long-lookahead-and-heavy-EMA matched
+       the recorded ackermann_cmd in mean and amplitude but produced a
+       much smoother trace (Pearson r=0.305, std=0.015) than the recorded
+       driver's (std=0.021 with 105 zero-crossings, lots of 5-15 Hz energy).
+       The PD-on-angle-to-target formulation reproduces that high-freq
+       wiggle character (Pearson r=0.587, std=0.027, 108 zero-crossings).
 
        Run with:
          ros2 launch final_challenge lane_follow_deploy.launch.xml
@@ -17,30 +18,18 @@
 
   <!-- ── Args (CLI-overridable) ─────────────────────────────────────── -->
   <arg name="nominal_speed" default="3.5"
-       description="Target speed on straights (m/s, max 4.0). Bumped from
-                    2.0 → 3.5 to match the recorded constant 3.5 m/s; pair
-                    with curvature_speed_gain=0 below for a flat trace."/>
+       description="Target speed on straights (m/s, max 4.0). Set to match
+                    the recorded constant 3.5 m/s."/>
   <arg name="drive_topic"   default="/vesc/low_level/input/navigation"
        description="AckermannDriveStamped topic consumed by the VESC"/>
-  <arg name="camera_y_offset" default="-0.28"
+  <arg name="camera_y_offset" default="-0.32"
        description="Lateral offset (m) added to incoming path-y so the
-                    controller works in a robot-center frame. Sign convention:
-                    +y = LEFT of robot in REP-103. The Johnson Track sweep
-                    landed at -0.28 m for the long-lookahead configuration
-                    below; it bundles the camera's mechanical mounting offset
-                    (~-0.06 m) with a residual detector + homography
-                    asymmetry on this bag. Recalibrate per camera mount/track:
-                    run bag_replay/sweep_offset.py against a fresh recording
-                    and take the BEST y_off."/>
-  <arg name="cte_gain" default="0.0"
-       description="Cross-track-error feedback gain (rad/m). The recorded
-                    driver was much smoother than CTE-pumped synth (CTE
-                    amplifies detector noise into per-frame steering wobble).
-                    With a well-calibrated camera_y_offset the BILATERAL
-                    midpoint already sits at y≈0 so CTE has nothing to do
-                    and only adds jitter. Bump back toward 0.5–1.0 for live
-                    driving if active recovery from large lateral pushes
-                    is needed."/>
+                    controller works in a robot-center frame. +y = LEFT in
+                    REP-103. The Johnson Track sweep landed at -0.32 m for
+                    the cone-pursuit configuration; bundles the camera's
+                    mechanical mount offset (~-0.06 m) with a residual
+                    detector + homography asymmetry. Recalibrate per camera
+                    mount/track via proof/sweep_offset.py."/>
 
   <!-- ── ZED camera ────────────────────────────────────────────────── -->
   <include file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py">
@@ -50,77 +39,41 @@
   <!-- ── Vision: white-line detection + homography ────────────────── -->
   <node pkg="final_challenge" exec="lane_detector" output="screen"/>
 
-  <!-- ── Control: bilateral midpoint pure-pursuit ────────────────── -->
+  <!-- ── Control: cone-pursuit PD on lane midpoint ────────────────── -->
   <node pkg="final_challenge" exec="boundary_pure_pursuit" output="screen">
-    <param name="drive_topic"         value="$(var drive_topic)"/>
-    <param name="nominal_speed"       value="$(var nominal_speed)"/>
-    <param name="camera_y_offset"     value="$(var camera_y_offset)"/>
-    <param name="cte_gain"            value="$(var cte_gain)"/>
-    <param name="enable_visualization" value="false"/>
+    <param name="drive_topic"     value="$(var drive_topic)"/>
+    <param name="nominal_speed"   value="$(var nominal_speed)"/>
+    <param name="camera_y_offset" value="$(var camera_y_offset)"/>
 
-    <!-- Lookahead distances (metres). 4.5 m looks well past the per-frame
-         detector wobble: pure pursuit averages noise over the sample
-         range, so a long lookahead is itself a low-pass on the steering
-         output. Halves the steering MAE on this bag vs the older 1.68 m.
-         The curvature-adaptive lookahead floors at min_lookahead_distance
-         on tight turns. -->
-    <param name="lookahead_distance"           value="4.5"/>
-    <param name="lost_line_lookahead_distance" value="0.9"/>
-    <param name="min_lookahead_distance"       value="0.5"/>
+    <!-- PD gains. parking_controller uses Kp=1.0, Kd=0.1 on a single-cone
+         target; lane-midpoint targets are ~10× noisier (per-frame stripe
+         wobble), so Kp=0.35 keeps the steering inside the recorded
+         envelope and Kd=0 avoids amplifying detector noise into clipped
+         spikes. -->
+    <param name="kp_steer" value="0.35"/>
+    <param name="kd_steer" value="0.0"/>
+    <param name="max_steering_angle" value="0.34"/>
 
-    <!-- Speed: pinned constant at 3.5 m/s to match the recorded trace.
-         min == max == nominal collapses the curvature-driven slowdown so
-         the synth speed doesn't dip when the path looks curvy. -->
-    <param name="lost_line_speed" value="3.5"/>
-    <param name="min_speed"       value="3.5"/>
-    <param name="max_speed"       value="3.5"/>
+    <!-- Geometry: sample the lane midpoint at this forward distance to
+         build the fake-cone target. Far enough that frame-to-frame y noise
+         (~few cm) translates to small angular jitter (~1.5°) — matches the
+         recorded driver's ~110 zero-crossings over 100 s. Half_lane is
+         the constant offset used when only one boundary is visible. -->
+    <param name="target_forward_distance" value="2.5"/>
+    <param name="half_lane_width"         value="0.30"/>
 
-    <!-- Curvature adaptation: off for flat-speed driving. The recorded
-         driver did not slow down on curves; setting gain=0 keeps speed
-         pinned at nominal regardless of |κ|. -->
-    <param name="curvature_speed_gain"    value="0.0"/>
-    <param name="curvature_lookahead_gain" value="2.0"/>
+    <!-- Control loop rate. Recorded driver was 33.5 Hz (2× 16 Hz camera);
+         match that. Per-tick math is sub-millisecond. -->
+    <param name="control_rate_hz" value="33.0"/>
 
-    <!-- Staleness / safety. The Johnson Track recording has 67 camera-
-         frame gaps >500 ms (max 736 ms) — a recording artifact, not on-
-         robot reality. Stretching freshness/staleness windows lets the
-         controller ride those out instead of dropping into STALE. With
-         stop_if_no_path=false the controller never emits zero-speed
-         during a gap; flip back to true if you want a hard safety-stop
-         on perception loss. -->
-    <param name="stale_path_timeout"  value="1.50"/>
-    <param name="fresh_msg_timeout"   value="0.80"/>
-    <param name="min_path_arc_length" value="0.0"/>
-    <param name="stop_if_no_path"     value="false"/>
-
-    <!-- Half-lane width plausibility. The bag's apparent lane spans only
-         ~0.6 m between the two visible white stripes, so the BILATERAL
-         acceptance window has to start at 0.4 m (= 2 × 0.20). The
-         standard 0.35–0.65 m window rejects almost every frame here. -->
-    <param name="half_width_init"     value="0.30"/>
-    <param name="half_width_min"      value="0.20"/>
-    <param name="half_width_max"      value="0.65"/>
-
-    <!-- Steering shaping. With long lookahead doing most of the work, a
-         very heavy EMA (0.05) on the output kills any leftover spike.
-         max_steering_angle 0.15 sits just above the recorded driver's
-         peak excursion (-0.148 rad) so legitimate corrections aren't
-         clipped but pure-pursuit overshoots are. -->
-    <param name="steering_alpha"      value="0.05"/>
-    <param name="max_steering_angle"  value="0.15"/>
-    <param name="target_alpha"        value="0.20"/>
-
-    <!-- Control loop rate. 50 Hz is the new default — per-tick math is
-         well under 1 ms, the synth output is denser, and the recorded-
-         vs-synth Pearson correlation goes from 0.21 (20 Hz) to 0.27. -->
-    <param name="control_rate_hz"     value="50.0"/>
-
-    <!-- BILATERAL_HOLD coverage. Stretching the hold window from 0.3 to
-         1.5 s covers the short single-side detector blackouts that
-         otherwise drop the controller into SINGLE_LINE. With this set,
-         effective bilateral coverage on the Johnson Track bag is 98.85%
-         (BILATERAL 80.0% + BILATERAL_HOLD 18.9%). -->
-    <param name="bilateral_hold_window" value="1.5"/>
+    <!-- Freshness / safety. The Johnson Track recording has 67 camera-
+         frame gaps >500 ms (max 736 ms) — recording artifact, not real
+         perception loss. Wide windows ride them out. With stop_if_no_path
+         off, the controller holds its last command across the gap rather
+         than emitting zero. Flip to true for a hard safety-stop. -->
+    <param name="fresh_msg_timeout"  value="0.80"/>
+    <param name="stale_path_timeout" value="1.50"/>
+    <param name="stop_if_no_path"    value="false"/>
   </node>
 
 </launch>

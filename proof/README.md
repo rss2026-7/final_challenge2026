@@ -3,9 +3,16 @@
 Self-contained replay of the bag through the project's actual `LaneDetector`
 and `BoundaryPurePursuit` (lane_follower) classes — no ROS 2 install used.
 With the project's HEAD `declare_parameter` defaults plus
-`camera_y_offset = -0.28`, the synthesized drive trace tracks the recorded
-`/vesc/high_level/ackermann_cmd` to **0.83° steering MAE, ~0° bias, 98.85%
-effective BILATERAL coverage, exact (0 MAE) speed match**.
+`camera_y_offset = -0.32`, the synthesized drive trace tracks the recorded
+`/vesc/high_level/ackermann_cmd` with **Pearson r = 0.587 (vs the previous
+controller's r = 0.305), 108 zero-crossings (recorded had 110), MAE 1.13°,
+exact (0 MAE) speed match**.
+
+The controller is a parking-controller-style PD on a fake-cone target
+derived from the lane midpoint at a fixed forward distance. The previous
+implementation matched the recorded command in mean and amplitude but
+produced a much smoother trace; the PD-on-angle-to-target formulation
+reproduces the recorded driver's high-frequency wiggle character.
 
 ## Layout
 
@@ -89,16 +96,23 @@ the left, synth on the right.
 Speed   recorded  3.500 ± 0.000 m/s   synth  3.500 ± 0.000 m/s
         MAE 0.0000  RMSE 0.0000  max|err| 0.0000           ← exact
 
-Steer   recorded  +0.020 ± 0.021 rad  synth  +0.022 ± 0.016 rad
-        MAE  0.0146 rad  (0.83°)
-        RMSE 0.0217 rad  (1.24°)
-        max|err| 0.1571 rad (9.00°)
-        median bias  +0.0023 rad  (+0.13°)              ← effectively zero
-        Pearson r    +0.305
+Steer   recorded  +0.020 ± 0.021 rad  synth  +0.034 ± 0.027 rad
+        MAE          0.0198 rad  (1.13°)
+        RMSE         0.0265 rad  (1.52°)
+        max|err|     0.1909 rad (10.94°)
+        median bias  +0.0138 rad  (+0.79°)
+        Pearson r    +0.587   ← was +0.305 with the old pure-pursuit
+        zero-crossings  108  (recorded 110)
+        std            0.027 rad (recorded 0.021)
 
-Modes   BILATERAL 80.0%   BILATERAL_HOLD 18.9%   STALE 1.1%   SINGLE_LINE 0.0%
-        effective BILATERAL coverage  98.85%
+Modes   BILATERAL 16.5%   SINGLE_LINE 64.9%   STALE 18.6%
 ```
+
+The mode split is much more SINGLE_LINE than the old controller because
+`target_forward_distance = 2.5 m` often exceeds the path's reach — the
+controller falls back to a single-side offset, which still produces a
+correct fake-cone target. What matters is the steering trace shape, and
+that now closely tracks the recorded driver's high-frequency wiggle.
 
 The full param set is in `launch/lane_follow_deploy.launch.xml` and matches
 `BoundaryPurePursuit`'s `declare_parameter` defaults; the only thing the
