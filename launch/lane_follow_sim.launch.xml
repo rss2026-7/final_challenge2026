@@ -11,8 +11,8 @@
 
   <arg name="camera"           default="false"
        description="Set true to enable the camera-driven lane_detector"/>
-  <arg name="cruise_speed_mps" default="4.1"
-       description="Forward speed (m/s) — reference racetrack value"/>
+  <arg name="cruise_speed_mps" default="2.5"
+       description="Forward speed (m/s)."/>
   <arg name="drive_topic"      default="/drive"
        description="AckermannDriveStamped topic the simulator subscribes to"/>
 

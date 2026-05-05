@@ -43,7 +43,7 @@ from bag_reader import iter_bag, bag_extents, DB as BAG_DB
 
 OUT_PATH = os.path.join(HERE, "output.mp4")
 
-CAMERA_Y_BIAS_M = -0.05   # mirrors LaneTracer.camera_lateral_offset_m default
+CAMERA_Y_BIAS_M = 0.05   # mirrors LaneTracer.camera_lateral_offset_m default
 VIDEO_SCALE     = 2
 CHART_HEIGHT_PX = 320
 FPS             = 15
