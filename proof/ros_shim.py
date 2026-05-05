@@ -279,6 +279,10 @@ class _Point(_Msg):
     def __init__(self) -> None:
         self.x = 0.0; self.y = 0.0; self.z = 0.0
 
+class _Point32(_Msg):
+    def __init__(self) -> None:
+        self.x = 0.0; self.y = 0.0; self.z = 0.0
+
 class _Quat(_Msg):
     def __init__(self) -> None:
         self.x = 0.0; self.y = 0.0; self.z = 0.0; self.w = 1.0
@@ -571,6 +575,7 @@ def install() -> None:
     geom = _mk("geometry_msgs")
     geom_msg = _mk("geometry_msgs.msg")
     geom_msg.Point = _Point
+    geom_msg.Point32 = _Point32
     geom_msg.Pose = _Pose
     geom_msg.PoseStamped = _PoseStamped
     geom_msg.PointStamped = _PointStamped

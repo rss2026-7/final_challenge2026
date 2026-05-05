@@ -1,432 +1,441 @@
 #!/usr/bin/env python3
+"""Hough-line lane detector + lookahead-point publisher.
+
+Pipeline (single image callback):
+
+    BGR frame
+        │
+        ▼  HSV mask of "white-ish" pixels
+        │  (broad V floor, narrow S ceiling)
+        ▼
+    Polygon ROI (drop sky and the car's hood)
+        │
+        ▼  Canny edges
+        ▼  Probabilistic Hough segments
+        ▼  Cluster co-linear segments, fit one line per cluster
+        ▼
+    Project each fit to ground plane (homography)
+        │
+        ▼  Reject implausible angles
+        │  Pick innermost left + innermost right boundary
+        ▼
+    Intersect the two boundary lines in image space
+        │
+        ▼  Walk the angle bisector from the intersection
+        │  toward the car a fixed pixel distance
+        ▼
+    Project that pixel back to ground plane → publish as Point32
+    on /lookahead_point
+
+Topics
+------
+Subscribes:
+    /zed/zed_node/rgb/image_rect_color/compressed   (sensor_msgs/CompressedImage)
+Publishes:
+    /lookahead_point                                 (geometry_msgs/Point32)
+    /lane_debug_img                                  (sensor_msgs/Image)
+"""
+from __future__ import annotations
+
+import math
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 import rclpy
+from cv_bridge import CvBridge
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from cv_bridge import CvBridge
+from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 
-from sensor_msgs.msg import Image, CompressedImage
-from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Point32
+from sensor_msgs.msg import CompressedImage, Image
 
-from final_challenge.white_line_detection import (
-    detect_lane_lines_hough,
-    detect_white_lines,
-    ROI_TOP_FRAC,
+from final_challenge.homography_transformer import (
+    build_homography, transform_uv_to_xy,
 )
-from final_challenge.homography_transformer import build_homography, transform_uv_to_xy
-
-# Tunable
-N_SAMPLES = 15   # points sampled per detected Hough line
-MIN_VOTES = 5    # discard Hough clusters with fewer accumulator votes
-MAX_ABS_Y = 1.5  # discard candidate lines whose median car-frame |y| exceeds this (outliers from
-                 # near-horizon homography projection)
-MIN_FORWARD_SPAN = 0.3  # forward-span gate applied to HOUGH detections only
-                        # (Hough lines are extrapolated and a short fit is
-                        # often noise). Blob spines skip this gate so the
-                        # controller sees the same short lines the calibration
-                        # GUI sees.
-MAX_X_CAR        = 4.0  # cap forward distance per sample. The homography horizon is at
-                        # v ≈ 138 px and ROI top is at v ≈ 150 px, so samples near the
-                        # ROI top project to wildly large x_car. 4 m is well past the
-                        # 1.2 m lookahead and bounds away from the projective horizon.
-MAX_DY_OVER_DX = 0.4    # path must be roughly forward-aligned. Real boundaries on
-                        # straights have |slope| < 0.15; mild curves up to ~0.35;
-                        # transverse markers register at |slope| ≥ 0.48. 0.4 keeps
-                        # gentle curves and rejects transverse markers cleanly.
 
 
-def _path_is_plausible_boundary(pts):
-    """Strict plausibility check used for HOUGH detections only: forward-span
-    + slope cap + non-degenerate x-spread. See _spine_path_is_sane for the
-    blob equivalent (no forward-span gate, since the GUI's blob overlay is
-    the single source of truth)."""
-    if len(pts) < 2:
-        return False
-    xs = np.array([p[0] for p in pts])
-    ys = np.array([p[1] for p in pts])
-    if xs[-1] - xs[0] < MIN_FORWARD_SPAN:
-        return False
-    if np.ptp(xs) < 1e-6:
-        return False
-    slope = np.polyfit(xs, ys, 1)[0]
-    if abs(slope) > MAX_DY_OVER_DX:
-        return False
-    return True
+# ───────────────────────────── tunables ──────────────────────────────────
+HSV_LOW         = np.array([0,   0, 200], dtype=np.uint8)
+HSV_HIGH        = np.array([180, 50, 255], dtype=np.uint8)
+
+ROI_TOP_FRAC    = 0.40   # crop everything above this fraction of image height
+
+CANNY_LOW       = 50
+CANNY_HIGH      = 150
+
+HOUGH_RHO       = 1
+HOUGH_THETA     = math.pi / 180.0
+HOUGH_THRESHOLD = 50
+HOUGH_MIN_LEN   = 100
+HOUGH_MAX_GAP   = 10
+
+CLUSTER_DIST_PX = 100.0
+CLUSTER_ANG_DEG = 10.0
+
+GROUND_ANGLE_FLOOR_DEG = -15.0
+GROUND_ANGLE_CEIL_DEG  =  60.0
+
+LOOKAHEAD_BISECTOR_PX  = 50.0  # walk this many pixels from intersection
+LOOKAHEAD_FALLBACK_X   = 1.5   # m forward, used when the geometry breaks
 
 
-def _spine_path_is_sane(pts):
-    """Blob-spine acceptance, intentionally lenient — matches the calibration
-    GUI's behavior (which displays raw blob spines with no car-frame filter).
-    Only the slope cap survives, so cross-track markers that slipped through
-    blob's internal _tangent_ok check still get rejected here. Short forward
-    spans are accepted: a partially-occluded boundary should not be dropped
-    just because the visible portion projects to <0.3 m of forward extent."""
-    if len(pts) < 2:
-        return False
-    xs = np.array([p[0] for p in pts])
-    ys = np.array([p[1] for p in pts])
-    if np.ptp(xs) < 1e-6:
-        return False
-    slope = np.polyfit(xs, ys, 1)[0]
-    if abs(slope) > MAX_DY_OVER_DX:
-        return False
-    return True
+# ───────────────────────────── geometry helpers ──────────────────────────
+def _segment_to_segment_min_distance(seg_a: np.ndarray,
+                                     seg_b: np.ndarray) -> float:
+    """Return min Euclidean distance between two 2-D segments
+    seg = [x1, y1, x2, y2]."""
+    p1 = seg_a[:2]; p2 = seg_a[2:]
+    p3 = seg_b[:2]; p4 = seg_b[2:]
+    return min(
+        _point_to_segment(p1, p3, p4),
+        _point_to_segment(p2, p3, p4),
+        _point_to_segment(p3, p1, p2),
+        _point_to_segment(p4, p1, p2),
+    )
 
 
-def _image_space_slope(spine):
-    """du/dv slope of an image-space spine (u = horizontal pixel, v = vertical
-    pixel; v increases downward).
-
-    Sign convention used for single-line classification:
-      du/dv > 0  → line slants down-and-to-the-right in the image. The bottom
-                   end of the line sits to the RIGHT of its top end. This is
-                   what a RIGHT lane boundary looks like in standard image
-                   coords.
-      du/dv < 0  → line slants down-and-to-the-left → LEFT boundary.
-      du/dv ≈ 0  → near-vertical line; angle is ambiguous and we should fall
-                   back to lateral-position classification.
-    """
-    if len(spine) < 2:
-        return 0.0
-    us = np.array([p[0] for p in spine], dtype=float)
-    vs = np.array([p[1] for p in spine], dtype=float)
-    if np.ptp(vs) < 2.0:
-        return 0.0
-    return float(np.polyfit(vs, us, 1)[0])
+def _point_to_segment(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    ab = b - a
+    L2 = float(np.dot(ab, ab))
+    if L2 <= 0.0:
+        return float(np.linalg.norm(p - a))
+    t = float(np.dot(p - a, ab)) / L2
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    return float(np.linalg.norm(p - (a + t * ab)))
 
 
-def _make_path(points, stamp, frame_id="base_link"):
-    """Build a nav_msgs/Path from a list of (x, y) tuples."""
-    msg = Path()
-    msg.header.stamp = stamp
-    msg.header.frame_id = frame_id
-    for x, y in points:
-        ps = PoseStamped()
-        ps.header.stamp = stamp
-        ps.header.frame_id = frame_id
-        ps.pose.position.x = float(x)
-        ps.pose.position.y = float(y)
-        ps.pose.position.z = 0.0
-        ps.pose.orientation.w = 1.0
-        msg.poses.append(ps)
-    return msg
+def _line_intersection_2d(seg_a: Sequence[float],
+                          seg_b: Sequence[float]
+                          ) -> Optional[Tuple[float, float]]:
+    """Intersect two infinite lines defined by their endpoints.  None when
+    parallel/coincident."""
+    x1, y1, x2, y2 = seg_a
+    x3, y3, x4, y4 = seg_b
+    A1 = y2 - y1; B1 = x1 - x2; C1 = x2 * y1 - x1 * y2
+    A2 = y4 - y3; B2 = x3 - x4; C2 = x4 * y3 - x3 * y4
+    det = A1 * B2 - A2 * B1
+    if abs(det) < 1e-9:
+        return None
+    return ((B1 * C2 - B2 * C1) / det,
+            (C1 * A2 - C2 * A1) / det)
 
 
-class LaneDetector(Node):
-    """
-    Detects left and right lane boundaries and publishes them as
-    nav_msgs/Path in base_link frame for BoundaryPurePursuit.
+def _angle_bisector_step(apex: Tuple[float, float],
+                         arm_a: Tuple[float, float],
+                         arm_b: Tuple[float, float],
+                         step_px: float) -> Tuple[float, float]:
+    """From apex, take step_px along the angle bisector of the two arms."""
+    ap = np.asarray(apex, dtype=float)
+    va = np.asarray(arm_a, dtype=float) - ap
+    vb = np.asarray(arm_b, dtype=float) - ap
+    na = float(np.linalg.norm(va)); nb = float(np.linalg.norm(vb))
+    if na < 1e-9 or nb < 1e-9:
+        return float(ap[0]), float(ap[1])
+    bisect = va / na + vb / nb
+    norm = float(np.linalg.norm(bisect))
+    if norm < 1e-9:
+        return float(ap[0]), float(ap[1])
+    bisect /= norm
+    end = ap + step_px * bisect
+    return float(end[0]), float(end[1])
 
-    Detection strategy
-    ------------------
-    1:1 with the calibration GUI: detect_white_lines() (blob) is the only
-    detector. Whatever spines the GUI overlays as green dots are the spines
-    we project through the homography and publish — no slope cap, no
-    forward-span gate, no median-y cut. The blob detector's own internal
-    filters (MIN_AREA → MIN_LONG_SIDE → MIN_ELONGATION → _tangent_ok) are
-    the single source of truth for what counts as a lane line. Hough is
-    intentionally not used here.
 
-    Single-line case: classified by image-space tilt (du/dv). Falling back
-    to lateral position only when the line is too close to vertical for the
-    angle to be unambiguous.
+# ───────────────────────────── line clustering ───────────────────────────
+def _cluster_and_regress(segments: np.ndarray,
+                         dist_thresh_px: float,
+                         angle_thresh_deg: float
+                         ) -> List[List[int]]:
+    """Greedy clustering of co-linear-ish Hough segments.  Returns a list
+    of clusters, each a list of indices into `segments`."""
+    n = segments.shape[0]
+    if n == 0:
+        return []
+    angles = np.degrees(np.arctan2(segments[:, 3] - segments[:, 1],
+                                   segments[:, 2] - segments[:, 0]))
+    angles = np.mod(angles + 180.0, 180.0)
 
-    Subscriptions
-    -------------
-    /zed/zed_node/rgb/image_rect_color  (sensor_msgs/Image)
+    visited = np.zeros(n, dtype=bool)
+    clusters: List[List[int]] = []
+    for i in range(n):
+        if visited[i]:
+            continue
+        visited[i] = True
+        bucket = [i]
+        for j in range(i + 1, n):
+            if visited[j]:
+                continue
+            d_ang = abs(angles[i] - angles[j])
+            d_ang = min(d_ang, 180.0 - d_ang)
+            if d_ang > angle_thresh_deg:
+                continue
+            if _segment_to_segment_min_distance(segments[i], segments[j]) > dist_thresh_px:
+                continue
+            visited[j] = True
+            bucket.append(j)
+        clusters.append(bucket)
+    return clusters
 
-    Publications
-    ------------
-    /left_lane_line   (nav_msgs/Path)  — left boundary in base_link frame
-    /right_lane_line  (nav_msgs/Path)  — right boundary in base_link frame
-    /lane_debug_img   (sensor_msgs/Image) — annotated frame for rqt_image_view
-    """
 
-    def __init__(self):
-        super().__init__("lane_detector")
+def _regress_cluster(segments: np.ndarray, idxs: List[int]) -> List[int]:
+    """Linear regression y = m·x + c through all endpoints in the cluster.
+    Returns [x_min, y(x_min), x_max, y(x_max)] as ints."""
+    members = segments[idxs]
+    pts = np.vstack([members[:, [0, 1]], members[:, [2, 3]]]).astype(float)
+    xs, ys = pts[:, 0], pts[:, 1]
+    if xs.shape[0] < 2 or float(np.ptp(xs)) < 1e-3:
+        x_min, x_max = float(xs.min()), float(xs.max())
+        y_min, y_max = float(ys.mean()), float(ys.mean())
+    else:
+        m, c = np.polyfit(xs, ys, 1)
+        x_min = float(xs.min()); x_max = float(xs.max())
+        y_min = m * x_min + c;   y_max = m * x_max + c
+    return [int(round(x_min)), int(round(y_min)),
+            int(round(x_max)), int(round(y_max))]
 
-        self.H = build_homography()
-        self.bridge = CvBridge()
 
-        self.left_pub  = self.create_publisher(Path,  "/left_lane_line",  10)
-        self.right_pub = self.create_publisher(Path,  "/right_lane_line", 10)
-        self.debug_pub = self.create_publisher(Image, "/lane_debug_img",  10)
+# ───────────────────────────── boundary picking ──────────────────────────
+def _pick_left_right(regression_segments: List[List[int]],
+                     project_uv_to_xy
+                     ) -> Tuple[Optional[List[int]],
+                                Optional[List[int]],
+                                Optional[Tuple[Tuple[float, float],
+                                               Tuple[float, float]]],
+                                Optional[Tuple[Tuple[float, float],
+                                               Tuple[float, float]]]]:
+    """For each regression segment, project both endpoints to the ground
+    plane.  Filter out lines whose ground-plane heading falls outside the
+    plausible band, then pick:
+      - left  boundary = ground line with the *smallest* |y|, y > 0
+      - right boundary = ground line with the *smallest* |y|, y < 0
+    Returns (left_pixel_segment, right_pixel_segment,
+             left_ground_segment, right_ground_segment)."""
+    if not regression_segments:
+        return None, None, None, None
 
-        # BEST_EFFORT, KEEP_LAST(1): always work on the newest frame; if
-        # we ever fall behind, drop the backlog at the DDS layer rather
-        # than queueing stale images that produce stale lane detections.
-        latest_image_qos = QoSProfile(
+    annotated = []  # (ground_segment, pixel_segment, near_y)
+    for pix in regression_segments:
+        x1, y1, x2, y2 = pix
+        g1 = project_uv_to_xy(x1, y1)
+        g2 = project_uv_to_xy(x2, y2)
+        # Order by ground-plane x (near → far) so "near_y" is well defined.
+        if g2[0] < g1[0]:
+            g1, g2 = g2, g1
+            pix_ordered = [x2, y2, x1, y1]
+        else:
+            pix_ordered = pix
+        heading_deg = math.degrees(math.atan2(g2[1] - g1[1], g2[0] - g1[0]))
+        if not (GROUND_ANGLE_FLOOR_DEG < heading_deg < GROUND_ANGLE_CEIL_DEG):
+            continue
+        annotated.append(((g1, g2), pix_ordered, g1[1]))
+
+    if not annotated:
+        return None, None, None, None
+
+    left_pool  = [a for a in annotated if a[2] > 0]
+    right_pool = [a for a in annotated if a[2] <= 0]
+
+    left  = min(left_pool,  key=lambda a: abs(a[2])) if left_pool  else None
+    right = min(right_pool, key=lambda a: abs(a[2])) if right_pool else None
+
+    return (left[1]  if left  else None,
+            right[1] if right else None,
+            left[0]  if left  else None,
+            right[0] if right else None)
+
+
+# ───────────────────────────── main detector node ────────────────────────
+class WhiteLineHunter(Node):
+    """Subscribe to the ZED stream, run the Hough pipeline, and publish a
+    single car-frame lookahead point per camera frame."""
+
+    def __init__(self) -> None:
+        super().__init__("white_line_hunter")
+
+        self._H = build_homography()
+        self._H_inv = np.linalg.inv(self._H)
+        self._bridge = CvBridge()
+
+        self.declare_parameter("camera_topic",
+                               "/zed/zed_node/rgb/image_rect_color/compressed")
+        self.declare_parameter("lookahead_topic",  "/lookahead_point")
+        self.declare_parameter("debug_image_topic", "/lane_debug_img")
+
+        cam_topic   = str(self.get_parameter("camera_topic").value)
+        look_topic  = str(self.get_parameter("lookahead_topic").value)
+        debug_topic = str(self.get_parameter("debug_image_topic").value)
+
+        latest_only = QoSProfile(
             depth=1,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
         )
         self.image_sub = self.create_subscription(
-            CompressedImage,
-            "/zed/zed_node/rgb/image_rect_color/compressed",
-            self.image_callback,
-            latest_image_qos,
+            CompressedImage, cam_topic, self._on_image, latest_only,
         )
+        self.lookahead_pub = self.create_publisher(Point32, look_topic, 10)
+        self.debug_pub     = self.create_publisher(Image,   debug_topic, 10)
 
-        self.get_logger().info("LaneDetector initialised.")
+        # Per-frame snapshots so external visualisers can pull the most
+        # recent geometry without re-running the pipeline.
+        self.last_left_pixel:  Optional[List[int]] = None
+        self.last_right_pixel: Optional[List[int]] = None
+        self.last_left_ground:  Optional[Tuple[Tuple[float, float],
+                                              Tuple[float, float]]] = None
+        self.last_right_ground: Optional[Tuple[Tuple[float, float],
+                                               Tuple[float, float]]] = None
+        self.last_lookahead_px: Optional[Tuple[float, float]] = None
+        self.last_lookahead_xy: Optional[Tuple[float, float]] = None
+        self.last_clusters: List[List[int]] = []
 
-    # ------------------------------------------------------------------
-    # Main callback
-    # ------------------------------------------------------------------
-    def image_callback(self, msg: CompressedImage):
-        arr = np.frombuffer(msg.data, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        self.get_logger().info("WhiteLineHunter up.")
+
+    # ── pipeline ─────────────────────────────────────────────────────────
+    def _on_image(self, msg: CompressedImage) -> None:
+        buf = np.frombuffer(msg.data, dtype=np.uint8)
+        frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if frame is None:
             self.get_logger().warn(
-                "lane_detector: cv2.imdecode returned None",
+                "imdecode returned None — dropping frame",
                 throttle_duration_sec=2.0,
             )
             return
-        h, w  = frame.shape[:2]
-        roi_top = int(ROI_TOP_FRAC * h)
-        stamp = msg.header.stamp
 
-        (left_pts, right_pts,
-         debug_lines, blob_spines) = self._detect_boundaries(
-            frame, h, w, roi_top
+        regression_segments = self._extract_regression_segments(frame)
+        self.last_clusters = list(regression_segments)
+
+        left_px, right_px, left_g, right_g = _pick_left_right(
+            regression_segments,
+            lambda u, v: transform_uv_to_xy(self._H, u, v),
         )
+        self.last_left_pixel = left_px
+        self.last_right_pixel = right_px
+        self.last_left_ground = left_g
+        self.last_right_ground = right_g
 
-        self.left_pub.publish(_make_path(left_pts,  stamp))
-        self.right_pub.publish(_make_path(right_pts, stamp))
-        self._publish_debug(frame, debug_lines, blob_spines, roi_top)
+        target_x, target_y, target_uv = self._derive_lookahead(
+            left_px, right_px,
+        )
+        self.last_lookahead_px = target_uv
+        self.last_lookahead_xy = (target_x, target_y)
 
-    # ------------------------------------------------------------------
-    # Boundary detection — blob only, 1:1 with the calibration GUI
-    # ------------------------------------------------------------------
-    def _detect_boundaries(self, frame, h, w, roi_top):
-        """
-        Return (left_pts, right_pts, debug_lines, blob_spines).
+        self._publish_lookahead(target_x, target_y)
+        self._publish_debug(frame, regression_segments,
+                            left_px, right_px, target_uv)
 
-        Whatever the calibration GUI shows as a green spine, this method
-        publishes. The only post-detection processing is the homography
-        projection itself, plus dropping points that don't project into
-        the car-frame strip 0 < x_car < MAX_X_CAR (the homography horizon
-        — points beyond it are numerically meaningless, not a content
-        filter).
-        """
-        blob_spines    = detect_white_lines(frame)
-        blob_car_lines = self._spines_to_car_lines(blob_spines)
+    # ── stage 1: HSV mask + ROI + Canny + Hough → clustered regressions ──
+    def _extract_regression_segments(self, frame: np.ndarray) -> List[List[int]]:
+        h, w = frame.shape[:2]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        white_mask = cv2.inRange(hsv, HSV_LOW, HSV_HIGH)
 
-        if not blob_car_lines:
-            self.get_logger().info(
-                f"No blob spines projected to a usable path "
-                f"(raw spines: {len(blob_spines)}).",
-                throttle_duration_sec=1.0,
-            )
-            return [], [], [], blob_spines
+        # Trapezoid ROI: clip sky + a small band off the bottom corners so
+        # the car hood reflection doesn't leak in as bright pixels.
+        roi_mask = np.zeros_like(white_mask)
+        top = int(h * ROI_TOP_FRAC)
+        poly = np.array([[
+            (0,                     h),
+            (w,                     h),
+            (int(w * 0.95), top),
+            (int(w * 0.05), top),
+        ]], dtype=np.int32)
+        cv2.fillPoly(roi_mask, poly, 255)
+        masked = cv2.bitwise_and(white_mask, roi_mask)
 
-        left_pts, right_pts = self._classify_car_lines(blob_car_lines)
-        return left_pts, right_pts, [], blob_spines
-
-    def _spines_to_car_lines(self, spines):
-        """1:1 with the calibration GUI: trust whatever detect_white_lines
-        returns. Project to car-frame, drop nothing on shape grounds. The
-        only criterion for skipping a spine is that fewer than 2 of its
-        points survived the projection's MAX_X_CAR clip — at which point
-        there's no path to publish.
-
-        Each entry carries the line's image-space slope so the single-line
-        classifier can decide left/right by tilt angle, not lateral
-        position alone."""
-        car_lines = []
-        for spine in spines:
-            pts = self._spine_to_car_pts(spine)
-            if len(pts) < 2:
-                continue
-            median_y = float(np.median([p[1] for p in pts]))
-            image_slope = _image_space_slope(spine)
-            car_lines.append((median_y, None, pts, image_slope))
-        return car_lines
-
-    def _hough_lines_to_car_lines(self, hough_lines, h, w, roi_top):
-        """Strict plausibility for the Hough fallback path: forward-span +
-        slope cap + accumulator-vote gate. Hough fits are noisier than blob
-        spines, so they need the tighter filter."""
-        car_lines = []
-        for ll in hough_lines:
-            if ll['votes'] < MIN_VOTES:
-                continue
-            pts = self._hough_line_to_car_pts(ll, h, w, roi_top)
-            if not _path_is_plausible_boundary(pts):
-                continue
-            median_y = float(np.median([p[1] for p in pts]))
-            if abs(median_y) > MAX_ABS_Y:
-                continue
-            # Hough returns x = m·y + b in image coords, so m IS du/dv.
-            image_slope = float(ll['coeffs'][0])
-            car_lines.append((median_y, ll, pts, image_slope))
-        return car_lines
-
-    # Slope (du/dv) magnitudes below this are treated as "near-vertical"
-    # and fall through to lateral-position classification.
-    SINGLE_LINE_SLOPE_DEADBAND = 0.05
-
-    def _classify_car_lines(self, car_lines):
-        """Two or more plausible lines: split innermost-pair as left/right
-        using their lateral position.
-
-        One line: classify by image-space tilt angle. A line slanting
-        down-and-to-the-right (du/dv > 0) is a RIGHT boundary; down-and-to-
-        the-left (du/dv < 0) is a LEFT boundary. Tilt is more stable than
-        lateral position when the car is hugging or straddling a boundary
-        (median_y can flip sign frame-to-frame in that case; the line's
-        tilt cannot). Falls back to median-y sign only when the line is
-        too close to vertical for the angle to be unambiguous."""
-        # _split_left_right expects 3-tuples; strip the slope.
-        if len(car_lines) >= 2:
-            return self._split_left_right([(c[0], c[1], c[2]) for c in car_lines])
-
-        median_y, _, pts, image_slope = car_lines[0]
-        if image_slope > self.SINGLE_LINE_SLOPE_DEADBAND:
-            return [], pts          # tilts down-right → RIGHT lane line
-        if image_slope < -self.SINGLE_LINE_SLOPE_DEADBAND:
-            return pts, []          # tilts down-left  → LEFT lane line
-        # Near-vertical: angle is unreliable, fall back to lateral position.
-        if median_y >= 0:
-            return pts, []
-        return [], pts
-
-    # ------------------------------------------------------------------
-    # Left / right classification in car frame
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _split_left_right(car_lines):
-        """
-        Given a list of (median_y, ll, pts), find the pair of lane boundaries
-        that bracket y=0 (the car centreline).
-
-        Left boundary  = line with y > 0 closest to y=0.
-        Right boundary = line with y < 0 closest to y=0 (least negative).
-
-        If all detected lines are on one side, only that side is returned;
-        the other is left empty. The controller handles an empty path safely
-        via stale-path memory + stop_if_no_path. Labelling a same-side line
-        as the opposite boundary would feed the wrong path to the controller
-        and steer the car toward the wall.
-        """
-        sorted_lines = sorted(car_lines, key=lambda t: t[0], reverse=True)
-
-        left_candidates  = [(m, pts) for m, _, pts in sorted_lines if m >= 0]
-        right_candidates = [(m, pts) for m, _, pts in sorted_lines if m <  0]
-
-        if left_candidates and right_candidates:
-            left_pts  = left_candidates[-1][1]   # smallest positive y
-            right_pts = right_candidates[0][1]   # least-negative y
-        elif left_candidates:
-            left_pts  = left_candidates[-1][1]
-            right_pts = []
-        else:
-            right_pts = right_candidates[0][1]
-            left_pts  = []
-
-        return left_pts, right_pts
-
-    # ------------------------------------------------------------------
-    # Pixel → car-frame conversion helpers
-    # ------------------------------------------------------------------
-    def _hough_line_to_car_pts(self, ll, h, w, roi_top):
-        """Sample a Hough line model into car-frame (x, y) points, near-to-far.
-
-        Skip samples where the line exits the image (clipping x_px to [0, w-1]
-        would pile points at the edge and the homography turns that L-kink into
-        fake curvature). Skip samples that project past MAX_X_CAR (the projective
-        horizon makes far samples meaningless).
-        """
-        m, b = ll['coeffs']
-        ys = np.linspace(h - 1, roi_top, N_SAMPLES)
-        xs = m * ys + b
-        keep = (xs >= 0) & (xs <= w - 1)
-        if not keep.any():
+        edges = cv2.Canny(masked, CANNY_LOW, CANNY_HIGH)
+        raw = cv2.HoughLinesP(
+            edges,
+            rho=HOUGH_RHO,
+            theta=HOUGH_THETA,
+            threshold=HOUGH_THRESHOLD,
+            minLineLength=HOUGH_MIN_LEN,
+            maxLineGap=HOUGH_MAX_GAP,
+        )
+        if raw is None or len(raw) == 0:
             return []
-        return self._project_uv_array(xs[keep], ys[keep])
 
-    def _spine_to_car_pts(self, spine):
-        """Convert a blob spine to car-frame points, near-to-far.
+        segs = raw[:, 0, :].astype(np.int32)
+        clusters = _cluster_and_regress(segs, CLUSTER_DIST_PX, CLUSTER_ANG_DEG)
+        return [_regress_cluster(segs, c) for c in clusters]
 
-        Cap x_car at MAX_X_CAR for the same reason as Hough: rows near the
-        ROI top project past the homography horizon and produce noise.
-        """
-        if not spine:
-            return []
-        arr = np.asarray(spine, dtype=np.float64)
-        return self._project_uv_array(arr[:, 0], arr[:, 1])
+    # ── stage 2: lookahead point from the two boundary lines ────────────
+    def _derive_lookahead(self, left_pix, right_pix
+                          ) -> Tuple[float, float, Optional[Tuple[float, float]]]:
+        """Compute (x_car, y_car, uv) of the lookahead.  Falls through to
+        a forward-axis fallback when geometry is unavailable."""
+        if left_pix is None or right_pix is None:
+            return 0.0, 0.0, None
 
-    def _project_uv_array(self, us, vs):
-        """Batch homography projection for a vector of (u, v) pixel coords.
-        Returns the projected points as a near-to-far list of (x, y) tuples,
-        filtered to the strip 0 < x_car < MAX_X_CAR.
-        """
-        n = us.shape[0]
-        if n == 0:
-            return []
-        homo = np.empty((3, n), dtype=np.float64)
-        homo[0] = us
-        homo[1] = vs
-        homo[2] = 1.0
-        proj = self.H @ homo
-        w = proj[2]
-        # Avoid divide-by-zero on the horizon line (proj[2] == 0).
-        valid_w = np.abs(w) > 1e-12
-        x_car = np.where(valid_w, proj[0] / np.where(valid_w, w, 1.0),
-                         np.inf)
-        y_car = np.where(valid_w, proj[1] / np.where(valid_w, w, 1.0),
-                         np.inf)
-        mask = valid_w & (x_car > 0.0) & (x_car < MAX_X_CAR)
-        if not mask.any():
-            return []
-        x_car = x_car[mask]
-        y_car = y_car[mask]
-        order = np.argsort(x_car)
-        return list(zip(x_car[order].tolist(), y_car[order].tolist()))
+        apex = _line_intersection_2d(left_pix, right_pix)
+        if apex is None:
+            return 0.0, 0.0, None
 
-    # ------------------------------------------------------------------
-    # Debug image
-    # ------------------------------------------------------------------
-    def _publish_debug(self, frame, debug_lines, blob_spines, roi_top):
-        dbg = frame.copy()
-        h, w = dbg.shape[:2]
+        # Walk the bisector toward the car (away from the apex) using the
+        # *near* endpoints of the two boundary lines as the angle arms.
+        u_target, v_target = _angle_bisector_step(
+            apex,
+            (right_pix[0], right_pix[1]),
+            (left_pix[0],  left_pix[1]),
+            LOOKAHEAD_BISECTOR_PX,
+        )
+        x, y = transform_uv_to_xy(self._H, u_target, v_target)
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return 0.0, 0.0, None
+        return float(x), float(y), (float(u_target), float(v_target))
 
-        cv2.line(dbg, (0, roi_top), (w, roi_top), (128, 128, 128), 1)
+    # ── publishers ───────────────────────────────────────────────────────
+    def _publish_lookahead(self, x_car: float, y_car: float) -> None:
+        m = Point32()
+        m.x = float(x_car)
+        m.y = float(y_car)
+        m.z = 0.0
+        self.lookahead_pub.publish(m)
 
-        # Blob spines as green dots (matches the calibration GUI overlay).
-        for spine in blob_spines:
-            for (sx, sy) in spine:
-                cv2.circle(dbg, (sx, sy), 2, (0, 255, 0), -1)
+    def _publish_debug(self, frame, regression_segments, left_pix, right_pix,
+                       target_uv) -> None:
+        if self.debug_pub is None:
+            return
+        canvas = frame.copy()
+        h, w = canvas.shape[:2]
+        cv2.line(canvas, (0, int(h * ROI_TOP_FRAC)),
+                 (w, int(h * ROI_TOP_FRAC)), (110, 110, 110), 1)
 
-        # Hough lines that survived the plausibility / dedup pass — orange.
-        for ll in debug_lines:
-            p1, p2 = ll['segment']
-            cv2.line(dbg, p1, p2, (0, 200, 255), 2)
-            cv2.circle(dbg, p1, 4, (0, 200, 255), -1)
-            cv2.circle(dbg, p2, 4, (0, 200, 255), -1)
+        for seg in regression_segments:
+            x1, y1, x2, y2 = seg
+            cv2.line(canvas, (x1, y1), (x2, y2), (200, 200, 200), 1, cv2.LINE_AA)
 
-        cv2.putText(dbg,
-                    f"blob={len(blob_spines)}  hough_kept={len(debug_lines)}",
-                    (4, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        if left_pix is not None:
+            cv2.line(canvas,
+                     (left_pix[0], left_pix[1]),
+                     (left_pix[2], left_pix[3]),
+                     (255, 120, 0), 3, cv2.LINE_AA)
+        if right_pix is not None:
+            cv2.line(canvas,
+                     (right_pix[0], right_pix[1]),
+                     (right_pix[2], right_pix[3]),
+                     (40, 40, 255), 3, cv2.LINE_AA)
 
-        self.debug_pub.publish(self.bridge.cv2_to_imgmsg(dbg, "bgr8"))
+        if target_uv is not None:
+            u, v = int(round(target_uv[0])), int(round(target_uv[1]))
+            cv2.drawMarker(canvas, (u, v), (0, 255, 255),
+                           cv2.MARKER_CROSS, 24, 3)
+            cv2.circle(canvas, (u, v), 9, (0, 255, 255), 2)
+
+        self.debug_pub.publish(self._bridge.cv2_to_imgmsg(canvas, "bgr8"))
 
 
-def main(args=None):
+def main(args=None) -> None:
     rclpy.init(args=args)
-    node = LaneDetector()
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
+    node = WhiteLineHunter()
+    pool = MultiThreadedExecutor()
+    pool.add_node(node)
     try:
-        executor.spin()
+        pool.spin()
     except KeyboardInterrupt:
         pass
     finally:
-        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

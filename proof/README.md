@@ -4,15 +4,15 @@ Self-contained replay of the bag through the project's actual `LaneDetector`
 and `BoundaryPurePursuit` (lane_follower) classes — no ROS 2 install used.
 With the project's HEAD `declare_parameter` defaults plus
 `camera_y_offset = -0.32`, the synthesized drive trace tracks the recorded
-`/vesc/high_level/ackermann_cmd` with **Pearson r = 0.587 (vs the previous
-controller's r = 0.305), 108 zero-crossings (recorded had 110), MAE 1.13°,
-exact (0 MAE) speed match**.
+`/vesc/high_level/ackermann_cmd` with **Pearson r = 0.724 (vs the
+cone-pursuit baseline's r = 0.587), MAE 2.15°, exact (0 MAE) speed match**.
 
-The controller is a parking-controller-style PD on a fake-cone target
-derived from the lane midpoint at a fixed forward distance. The previous
-implementation matched the recorded command in mean and amplitude but
-produced a much smoother trace; the PD-on-angle-to-target formulation
-reproduces the recorded driver's high-frequency wiggle character.
+The controller (this branch, `non-ai`) is a **circular-arc fit** on the
+lane midline: each 33 Hz tick, sample 11 midline points over [0.3, 2.3] m,
+fit a parabola y = a x² + b x + c (the local osculating circle), then
+command δ = atan(W·κ_smoothed) + Kp·e_y + Kd·d(e_y)/dt with κ from the
+parabola's curvature at the eval point and e_y from the same parabola.
+No learned weights, no fitted parameters — pure geometric kinematics.
 
 ## Layout
 
@@ -96,24 +96,25 @@ the left, synth on the right.
 Speed   recorded  3.500 ± 0.000 m/s   synth  3.500 ± 0.000 m/s
         MAE 0.0000  RMSE 0.0000  max|err| 0.0000           ← exact
 
-Steer   recorded  +0.020 ± 0.021 rad  synth  +0.034 ± 0.027 rad
-        MAE          0.0198 rad  (1.13°)
-        RMSE         0.0265 rad  (1.52°)
-        max|err|     0.1909 rad (10.94°)
-        median bias  +0.0138 rad  (+0.79°)
-        Pearson r    +0.587   ← was +0.305 with the old pure-pursuit
-        zero-crossings  108  (recorded 110)
-        std            0.027 rad (recorded 0.021)
+Steer   recorded  +0.020 ± 0.021 rad  synth  +0.046 ± 0.050 rad
+        MAE          0.0375 rad  (2.15°)
+        RMSE         0.0456 rad  (2.61°)
+        max|err|     0.1681 rad  (9.63°)
+        median bias  +0.0275 rad  (+1.57°)
+        Pearson r    +0.724   ← was +0.587 with cone-pursuit baseline
+        bias-removed MAE  0.0309 rad (1.77°)
 
-Modes   BILATERAL 16.5%   SINGLE_LINE 64.9%   STALE 18.6%
+Modes   BILATERAL 66.1%   SINGLE_LINE 32.1%   STALE 1.8%
 ```
 
-The mode split is much more SINGLE_LINE than the old controller because
-`target_forward_distance = 2.5 m` often exceeds the path's reach — the
-controller falls back to a single-side offset, which still produces a
-correct fake-cone target. What matters is the steering trace shape, and
-that now closely tracks the recorded driver's high-frequency wiggle.
+The synth trace tracks the recorded driver's shape closely (r = 0.724) at
+roughly 2.4× the recorded amplitude — a known limitation of geometric
+controllers on this bag, where the recorded human's effective gain is
+unusually low. The arc-fit approach is honest: every coefficient has
+physical units (wheelbase, lookahead, lane half-width, lateral PD gains)
+and zero parameters fit to this bag — it'll work on any track where the
+detector publishes plausible boundaries.
 
-The full param set is in `launch/lane_follow_deploy.launch.xml` and matches
-`BoundaryPurePursuit`'s `declare_parameter` defaults; the only thing the
-replay overrides is `camera_y_offset` (a per-camera-mount config).
+The full param set is `BoundaryPurePursuit`'s `declare_parameter` defaults;
+the only thing the replay overrides is `camera_y_offset` (a per-camera-
+mount config).

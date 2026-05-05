@@ -1,382 +1,238 @@
 #!/usr/bin/env python3
-"""
-BoundaryPurePursuit — lane-center follower modeled on parking_controller.py.
+"""Pure-pursuit drive-out for a single car-frame lookahead point.
 
-Why this exists
----------------
-The previous pure-pursuit-with-long-lookahead-and-heavy-EMA implementation
-matched the recorded /vesc/high_level/ackermann_cmd in mean and amplitude
-but not in shape: recorded had std=0.021 with 105 zero-crossings and
-significant 5-15 Hz energy; the smoothed pure-pursuit synth had std=0.015
-with only 11 zero-crossings and almost no high-frequency content.
+Subscribes to a stream of `geometry_msgs/Point32` (one point per camera
+frame, expressed in the rear-axle frame: +x forward, +y left).  For each
+point we compute the bearing eta = atan2(y, x), pick a lookahead radius
+D from the {tangent / default / corner} schedule, and emit
 
-The recorded driver was almost certainly a re-purposed `parking_controller`:
-PD on `arctan2(target_y, target_x)` at every camera frame, no EMA, ±0.34 rad
-clip, Kp=1.0, Kd=0.1. The cyan target dot in /cone_debug_img sits at image
-bottom-center, which is what the lane midpoint at a short forward distance
-projects to. We reproduce that exact recipe here: each control tick takes
-the latest left+right paths, builds a single (target_x, target_y) point at
-a fixed forward distance, and runs the parking_controller PD verbatim.
+    delta = atan2( 2 W sin(eta), D )
 
-Control law
------------
-    angle  = atan2(target_y, target_x)
-    derror = (angle - prev_angle) / dt
-    δ      = clip(Kp·angle − Kd·derror, ±max_steer)
-
-Subscriptions
--------------
-    /left_lane_line   (nav_msgs/Path) — left boundary in camera frame
-    /right_lane_line  (nav_msgs/Path) — right boundary in camera frame
-
-Publications
-------------
-    /drive            (ackermann_msgs/AckermannDriveStamped)
-    /lookahead_target (visualization_msgs/Marker)
+When no fresh point is available we hold the most recent steer for a
+short grace window before idling the wheels.
 """
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import numpy as np
+
 import rclpy
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
-from nav_msgs.msg import Path
-from sensor_msgs.msg import Image, CompressedImage
 from ackermann_msgs.msg import AckermannDriveStamped
-from visualization_msgs.msg import Marker
+from geometry_msgs.msg import Point32
 from rcl_interfaces.msg import SetParametersResult
+from visualization_msgs.msg import Marker
 
 
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
+def _saturate(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else (hi if v > hi else v)
 
 
-def interp_y_at_x(path: List[Tuple[float, float]], x: float) -> Optional[float]:
-    """Linear interpolation: given a near-to-far x-sorted path, return y at given x.
-    Returns None if x is outside the path's x-range (no extrapolation)."""
-    if len(path) < 2 or x < path[0][0] or x > path[-1][0]:
-        return None
-    for i in range(1, len(path)):
-        if path[i][0] >= x:
-            x0, y0 = path[i - 1]
-            x1, y1 = path[i]
-            if x1 == x0:
-                return y0
-            t = (x - x0) / (x1 - x0)
-            return y0 + t * (y1 - y0)
-    return path[-1][1]
+class LaneTracer(Node):
+    """ROS 2 node that turns a /lookahead_point stream into a drive command.
 
+    Output topics
+    -------------
+    drive_topic         AckermannDriveStamped
+    /lookahead_target   visualization_msgs/Marker (sphere, color = state)
 
-class BoundaryPurePursuit(Node):
-    """Cone-pursuit-style PD on the lane midpoint at a fixed forward distance.
-
-    All the smoothing machinery from the old version is gone (no EMA on
-    target, no EMA on output, no learned half-width, no BILATERAL_HOLD,
-    no curvature-adaptive lookahead). The high-frequency content of
-    ``arctan2(target_y, target_x)`` per camera frame becomes the high-
-    frequency content of the steering command — exactly the spectral
-    character the recorded driver shows.
+    Marker color schedule (kept stable so visualisers can decode):
+        FRESH_POINT → green
+        HELD_POINT  → yellow
+        BLIND       → red
     """
 
+    STATE_FRESH = "FRESH_POINT"
+    STATE_HELD  = "HELD_POINT"
+    STATE_BLIND = "BLIND"
+
+    _MARKER_COLORS = {
+        STATE_FRESH: (0.0, 1.0, 0.0),
+        STATE_HELD:  (1.0, 1.0, 0.0),
+        STATE_BLIND: (1.0, 0.0, 0.0),
+    }
+
     def __init__(self) -> None:
-        super().__init__("boundary_pure_pursuit")
+        super().__init__("lane_tracer")
 
-        # ── topic names ─────────────────────────────────────────────────
-        self.declare_parameter("left_line_topic", "/left_lane_line")
-        self.declare_parameter("right_line_topic", "/right_lane_line")
-        self.declare_parameter("drive_topic", "/drive")
+        # ── topic wiring ────────────────────────────────────────────────
+        self.declare_parameter("lookahead_topic", "/lookahead_point")
+        self.declare_parameter("drive_topic",     "/drive")
 
-        # ── PD gains ────────────────────────────────────────────────────
-        # Kp=0.35 (vs parking_controller's 1.0): the bag's lane-midpoint
-        # target is much noisier than a single visual cone, so the
-        # parking_controller's full Kp would saturate the steering envelope
-        # ~0.5× the time. 0.35 keeps the trace inside the recorded ±0.15
-        # rad band while preserving the per-frame wiggle.
-        self.declare_parameter("kp_steer", 0.35)
-        # Kd=0 (vs parking_controller's 0.1): the parking_controller's Kd
-        # damps a slowly-varying single-cone target. Lane-midpoint angle
-        # changes ~10× faster (per-frame stripe wobble), so Kd>0 amplifies
-        # detector noise into clipped steering spikes. The recorded driver's
-        # high-frequency content comes from the natural per-frame Kp·angle
-        # signal, not from a derivative.
-        self.declare_parameter("kd_steer", 0.0)
-        # Output clip — parking_controller uses 0.34 (~19.5°). Recorded peak
-        # was 0.148, so 0.34 leaves headroom and never clips legitimate
-        # corrections.
-        self.declare_parameter("max_steering_angle", 0.34)
+        # ── geometry & pursuit gains (mirrors the racetrack reference) ──
+        self.declare_parameter("wheelbase_m", 0.33)
+        self.declare_parameter("pursuit_radius_default_m", 4.0)
+        self.declare_parameter("pursuit_radius_corner_m",  1.5)
+        self.declare_parameter("pursuit_radius_tangent_m", 3.5)
+        self.declare_parameter("eta_corner_deadband_rad",  0.2)
+        self.declare_parameter("camera_lateral_offset_m",  0.0)
 
-        # ── Geometry ────────────────────────────────────────────────────
-        # Forward distance at which we sample the lane midpoint to form the
-        # "fake-cone" target. 2.5 m is far enough that frame-to-frame y
-        # noise (a few cm) translates to small angular jitter (~1.5°),
-        # matching the recorded driver's ~110 zero-crossings over 100 s.
-        self.declare_parameter("target_forward_distance", 2.5)
-        # Half-lane width used when only one boundary is visible. Fixed
-        # constant (no learned EMA) to keep the controller stateless.
-        self.declare_parameter("half_lane_width", 0.30)
-        # Lateral offset added to incoming path y so the controller works
-        # in a robot-center frame (camera mounted slightly off-center).
-        self.declare_parameter("camera_y_offset", -0.32)
+        # ── safety & cadence ─────────────────────────────────────────────
+        self.declare_parameter("cruise_speed_mps",   2.5)
+        self.declare_parameter("max_steering_rad",   0.34)
+        self.declare_parameter("freshness_window_s", 0.80)
+        self.declare_parameter("tick_rate_hz",       33.0)
+        self.declare_parameter("idle_when_blind",    True)
 
-        # ── Speed (constant) ────────────────────────────────────────────
-        self.declare_parameter("nominal_speed", 3.5)
+        self._refresh_tunables()
 
-        # ── Control loop rate ───────────────────────────────────────────
-        # Recorded driver published at 33.5 Hz (2× the 16 Hz camera). Match
-        # that. Per-tick we recompute the angle from the freshest path and
-        # publish; consecutive ticks within one camera frame produce the
-        # same target but a non-zero derror (smoothed by dt).
-        self.declare_parameter("control_rate_hz", 33.0)
+        cb_group = MutuallyExclusiveCallbackGroup()
+        self._cb_group = cb_group
 
-        # ── Freshness / safety ──────────────────────────────────────────
-        # Bag has 67 camera-frame gaps >500 ms — recording artifact, not
-        # real perception loss — so the freshness window is generous.
-        self.declare_parameter("fresh_msg_timeout", 0.80)
-        self.declare_parameter("stale_path_timeout", 1.50)
-        # If True, publish 0 m/s when no path is fresh; if False, hold the
-        # previous command across the dropout. False matches the recorded
-        # driver's behavior on this bag.
-        self.declare_parameter("stop_if_no_path", False)
+        look_topic  = str(self.get_parameter("lookahead_topic").value)
+        drive_topic = str(self.get_parameter("drive_topic").value)
 
-        # ── Pull params, build the node ─────────────────────────────────
-        self._load_tunable_params()
-
-        left_topic  = self.get_parameter("left_line_topic").value
-        right_topic = self.get_parameter("right_line_topic").value
-        drive_topic = self.get_parameter("drive_topic").value
-
-        # Single-threaded callback group so reads of latest_*_path are
-        # serialized w.r.t. the control timer.
-        self.control_cbgroup = MutuallyExclusiveCallbackGroup()
-
-        self.left_sub = self.create_subscription(
-            Path, left_topic, self.left_line_callback, 10,
-            callback_group=self.control_cbgroup,
+        self.aim_sub = self.create_subscription(
+            Point32, look_topic, self._handle_aim_point, 10,
+            callback_group=cb_group,
         )
-        self.right_sub = self.create_subscription(
-            Path, right_topic, self.right_line_callback, 10,
-            callback_group=self.control_cbgroup,
-        )
-
-        self.drive_pub = self.create_publisher(
+        self.drive_pub  = self.create_publisher(
             AckermannDriveStamped, drive_topic, 10,
         )
         self.marker_pub = self.create_publisher(
             Marker, "/lookahead_target", 10,
         )
 
-        # Latest fresh boundary paths, in robot-center frame
-        # (camera_y_offset already applied)
-        self.latest_left_path:  List[Tuple[float, float]] = []
-        self.latest_right_path: List[Tuple[float, float]] = []
-        self.latest_left_path_time  = None
-        self.latest_right_path_time = None
+        # ── state ───────────────────────────────────────────────────────
+        self._latest_aim:    Optional[tuple] = None  # (x, y) in car frame
+        self._latest_aim_ts: Optional[object] = None
+        self._held_steer: float = 0.0
 
-        # PD state
-        self.prev_angle: Optional[float] = None
-        self.prev_time_ns: Optional[int] = None
-        self.last_steer = 0.0          # held during dropouts when stop_if_no_path=False
-        self.last_target: Optional[Tuple[float, float, str]] = None
-
-        # Inverse homography exposed for the visualizer (unchanged contract)
+        # ── inverse homography exposed for downstream visualisers ───────
         from final_challenge.homography_transformer import build_homography
-        self.H = build_homography()
-        self.H_inv = np.linalg.inv(self.H)
+        self._H = build_homography()
+        self.H_inv = np.linalg.inv(self._H)
 
-        # Control loop
-        period = 1.0 / max(self.control_rate_hz, 1.0)
+        # ── periodic control tick ────────────────────────────────────────
+        period = 1.0 / max(float(self.tick_rate_hz), 1.0)
         self.control_timer = self.create_timer(
-            period, self.control_loop,
-            callback_group=self.control_cbgroup,
+            period, self._tick, callback_group=cb_group,
         )
 
-        self.add_on_set_parameters_callback(self._on_param_change)
+        self.add_on_set_parameters_callback(self._on_param_update)
 
         self.get_logger().info(
-            f"BoundaryPurePursuit (cone-pursuit PD) started — "
-            f"Kp={self.kp_steer:.2f} Kd={self.kd_steer:.2f} "
-            f"target_x={self.target_forward_distance:.2f} m  "
-            f"rate={self.control_rate_hz:.0f} Hz  "
-            f"camera_y_offset={self.camera_y_offset:+.3f} m"
+            f"LaneTracer up — W={self.wheelbase_m:.2f} m, "
+            f"D={self.pursuit_radius_tangent_m:.1f}/{self.pursuit_radius_default_m:.1f}/"
+            f"{self.pursuit_radius_corner_m:.1f} m (tan/def/cor), "
+            f"v={self.cruise_speed_mps:.1f} m/s"
         )
 
-    # ── parameter helpers ──────────────────────────────────────────────
-    def _load_tunable_params(self) -> None:
-        self.kp_steer = float(self.get_parameter("kp_steer").value)
-        self.kd_steer = float(self.get_parameter("kd_steer").value)
-        self.max_steering_angle = float(self.get_parameter("max_steering_angle").value)
-        self.target_forward_distance = float(
-            self.get_parameter("target_forward_distance").value
-        )
-        self.half_lane_width = float(self.get_parameter("half_lane_width").value)
-        self.camera_y_offset = float(self.get_parameter("camera_y_offset").value)
-        self.nominal_speed = float(self.get_parameter("nominal_speed").value)
-        self.control_rate_hz = float(self.get_parameter("control_rate_hz").value)
-        self.fresh_msg_timeout = float(self.get_parameter("fresh_msg_timeout").value)
-        self.stale_path_timeout = float(self.get_parameter("stale_path_timeout").value)
-        self.stop_if_no_path = bool(self.get_parameter("stop_if_no_path").value)
+    # ── parameters ───────────────────────────────────────────────────────
+    def _refresh_tunables(self) -> None:
+        g = self.get_parameter
+        self.wheelbase_m = float(g("wheelbase_m").value)
+        self.pursuit_radius_default_m = float(g("pursuit_radius_default_m").value)
+        self.pursuit_radius_corner_m  = float(g("pursuit_radius_corner_m").value)
+        self.pursuit_radius_tangent_m = float(g("pursuit_radius_tangent_m").value)
+        self.eta_corner_deadband_rad  = float(g("eta_corner_deadband_rad").value)
+        self.camera_lateral_offset_m  = float(g("camera_lateral_offset_m").value)
+        self.cruise_speed_mps         = float(g("cruise_speed_mps").value)
+        self.max_steering_rad         = float(g("max_steering_rad").value)
+        self.freshness_window_s       = float(g("freshness_window_s").value)
+        self.tick_rate_hz             = float(g("tick_rate_hz").value)
+        self.idle_when_blind          = bool(g("idle_when_blind").value)
 
-    def _on_param_change(self, params) -> SetParametersResult:
-        float_params = {
-            "kp_steer", "kd_steer", "max_steering_angle",
-            "target_forward_distance", "half_lane_width", "camera_y_offset",
-            "nominal_speed", "control_rate_hz",
-            "fresh_msg_timeout", "stale_path_timeout",
+    def _on_param_update(self, params) -> SetParametersResult:
+        floats = {
+            "wheelbase_m", "pursuit_radius_default_m", "pursuit_radius_corner_m",
+            "pursuit_radius_tangent_m", "eta_corner_deadband_rad",
+            "camera_lateral_offset_m", "cruise_speed_mps",
+            "max_steering_rad", "freshness_window_s", "tick_rate_hz",
         }
         for p in params:
-            if p.name in float_params:
+            if p.name in floats:
                 setattr(self, p.name, float(p.value))
-            elif p.name == "stop_if_no_path":
-                self.stop_if_no_path = bool(p.value)
+            elif p.name == "idle_when_blind":
+                self.idle_when_blind = bool(p.value)
         return SetParametersResult(successful=True)
 
-    # ── path callbacks ─────────────────────────────────────────────────
-    def left_line_callback(self, msg: Path) -> None:
-        self.latest_left_path = self._extract_valid_points(msg)
-        self.latest_left_path_time = self.get_clock().now()
+    # ── input ────────────────────────────────────────────────────────────
+    def _handle_aim_point(self, msg: Point32) -> None:
+        x, y = float(msg.x), float(msg.y)
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return
+        # The detector publishes (0, 0) as a sentinel for "no geometry";
+        # treat it as if the message hadn't arrived rather than steering
+        # toward the rear axle.
+        if x == 0.0 and y == 0.0:
+            return
+        self._latest_aim = (x, y + self.camera_lateral_offset_m)
+        self._latest_aim_ts = self.get_clock().now()
 
-    def right_line_callback(self, msg: Path) -> None:
-        self.latest_right_path = self._extract_valid_points(msg)
-        self.latest_right_path_time = self.get_clock().now()
+    # ── pursuit law ──────────────────────────────────────────────────────
+    def _select_lookahead(self, eta_rad: float) -> float:
+        if abs(eta_rad) > self.eta_corner_deadband_rad:
+            return self.pursuit_radius_corner_m
+        return self.pursuit_radius_tangent_m
 
-    def _extract_valid_points(self, msg: Path) -> List[Tuple[float, float]]:
-        """Convert nav_msgs/Path into a near-to-far list of (x, y) in the
-        robot-center frame. Adds camera_y_offset to every y."""
-        dy = self.camera_y_offset
-        points: List[Tuple[float, float]] = []
-        for ps in msg.poses:
-            x = ps.pose.position.x
-            y = ps.pose.position.y
-            if not math.isfinite(x) or not math.isfinite(y):
-                continue
-            if x < -0.2:
-                continue
-            points.append((x, y + dy))
-        points.sort(key=lambda p: p[0])
-        return points
+    def _aim_is_fresh(self) -> bool:
+        if self._latest_aim is None or self._latest_aim_ts is None:
+            return False
+        age_s = (self.get_clock().now() - self._latest_aim_ts).nanoseconds * 1e-9
+        return age_s <= self.freshness_window_s
 
-    # ── freshness check ────────────────────────────────────────────────
-    def _fresh(self, side: str) -> Optional[List[Tuple[float, float]]]:
-        if side == "left":
-            path = self.latest_left_path
-            ts = self.latest_left_path_time
-        else:
-            path = self.latest_right_path
-            ts = self.latest_right_path_time
-        if ts is None or len(path) < 2:
-            return None
-        age = (self.get_clock().now() - ts).nanoseconds * 1e-9
-        if age > self.fresh_msg_timeout:
-            return None
-        return path
+    # ── tick ─────────────────────────────────────────────────────────────
+    def _tick(self) -> None:
+        fresh = self._aim_is_fresh()
+        aim = self._latest_aim if fresh else None
 
-    # ── target computation: pick (x_target, y_target) ──────────────────
-    def _compute_target(self) -> Optional[Tuple[float, float, str]]:
-        """Build the fake-cone target at the configured forward distance.
-
-        Returns (x_target, y_target, mode) or None if no usable path."""
-        x_target = self.target_forward_distance
-        L = self._fresh("left")
-        R = self._fresh("right")
-
-        if L is not None and R is not None:
-            yl = interp_y_at_x(L, x_target)
-            yr = interp_y_at_x(R, x_target)
-            if yl is not None and yr is not None:
-                return (x_target, 0.5 * (yl + yr), "BILATERAL")
-            if yl is not None:
-                return (x_target, yl - self.half_lane_width, "SINGLE_LINE")
-            if yr is not None:
-                return (x_target, yr + self.half_lane_width, "SINGLE_LINE")
-
-        if L is not None:
-            yl = interp_y_at_x(L, x_target)
-            if yl is not None:
-                return (x_target, yl - self.half_lane_width, "SINGLE_LINE")
-        if R is not None:
-            yr = interp_y_at_x(R, x_target)
-            if yr is not None:
-                return (x_target, yr + self.half_lane_width, "SINGLE_LINE")
-
-        return None
-
-    # ── control loop ───────────────────────────────────────────────────
-    def control_loop(self) -> None:
-        now = self.get_clock().now()
-        now_ns = now.nanoseconds
-
-        target = self._compute_target()
-
-        if target is None:
-            # No usable path. Either hold the last command (recorded driver's
-            # behavior) or stop.
-            self._publish_marker(self.last_target, "STALE", color=(1.0, 0.0, 0.0))
-            if self.stop_if_no_path:
-                self._publish_drive(0.0, 0.0)
+        if aim is None:
+            self._publish_marker(self._latest_aim, self.STATE_BLIND)
+            if self.idle_when_blind:
+                self._send_drive(0.0, 0.0)
             else:
-                self._publish_drive(self.nominal_speed, self.last_steer)
+                self._send_drive(self.cruise_speed_mps, self._held_steer)
             return
 
-        x_t, y_t, mode = target
+        ax, ay = aim
+        if ax <= 1e-3:
+            # Aim-point at/behind the rear axle — pursuit law breaks; coast.
+            self._publish_marker(aim, self.STATE_HELD)
+            self._send_drive(self.cruise_speed_mps, self._held_steer)
+            return
 
-        # ── parking_controller PD verbatim ─────────────────────────────
-        angle_to_target = math.atan2(y_t, x_t)
-        if self.prev_time_ns is None or self.prev_angle is None:
-            derror = 0.0
-        else:
-            dt = max((now_ns - self.prev_time_ns) * 1e-9, 1e-3)
-            derror = (angle_to_target - self.prev_angle) / dt
+        eta = math.atan2(ay, ax)
+        D = self._select_lookahead(eta)
+        steer = math.atan2(2.0 * self.wheelbase_m * math.sin(eta), D)
+        steer = _saturate(steer, -self.max_steering_rad, self.max_steering_rad)
 
-        steering_cmd = self.kp_steer * angle_to_target - self.kd_steer * derror
-        steering_angle = clamp(
-            steering_cmd, -self.max_steering_angle, self.max_steering_angle,
-        )
+        self._held_steer = steer
+        self._publish_marker(aim, self.STATE_FRESH)
+        self._send_drive(self.cruise_speed_mps, steer)
 
-        self.prev_angle   = angle_to_target
-        self.prev_time_ns = now_ns
-        self.last_steer   = steering_angle
-        self.last_target  = (x_t, y_t, mode)
+    # ── publishers ───────────────────────────────────────────────────────
+    def _send_drive(self, v_mps: float, steer_rad: float) -> None:
+        cmd = AckermannDriveStamped()
+        cmd.header.stamp = self.get_clock().now().to_msg()
+        cmd.header.frame_id = "base_link"
+        cmd.drive.speed = float(v_mps)
+        cmd.drive.steering_angle = float(steer_rad)
+        self.drive_pub.publish(cmd)
 
-        # Marker BEFORE drive so subscribers that key off drive_pub timestamps
-        # can read the matching mode color.
-        marker_color = (0.0, 1.0, 0.0) if mode == "BILATERAL" else (1.0, 1.0, 0.0)
-        self._publish_marker(self.last_target, mode, color=marker_color)
-        self._publish_drive(self.nominal_speed, steering_angle)
-
-    # ── publishers ─────────────────────────────────────────────────────
-    def _publish_drive(self, speed: float, steering_angle: float) -> None:
-        msg = AckermannDriveStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "base_link"
-        msg.drive.speed = float(speed)
-        msg.drive.steering_angle = float(steering_angle)
-        self.drive_pub.publish(msg)
-
-    def _publish_marker(self, target: Optional[Tuple[float, float, str]],
-                        mode: str, color: Tuple[float, float, float]) -> None:
+    def _publish_marker(self, aim: Optional[tuple], state: str) -> None:
         m = Marker()
         m.header.frame_id = "base_link"
         m.header.stamp = self.get_clock().now().to_msg()
-        m.ns = "boundary_pure_pursuit"
+        m.ns = "lane_tracer"
         m.id = 0
         m.type = Marker.SPHERE
         m.action = Marker.ADD
-        if target is not None:
-            m.pose.position.x = float(target[0])
-            m.pose.position.y = float(target[1])
-        else:
+        if aim is None:
             m.pose.position.x = 0.0
             m.pose.position.y = 0.0
+        else:
+            m.pose.position.x = float(aim[0])
+            m.pose.position.y = float(aim[1])
         m.pose.position.z = 0.05
         m.pose.orientation.w = 1.0
         m.scale.x = m.scale.y = m.scale.z = 0.10
-        r, g, b = color
+        r, g, b = self._MARKER_COLORS.get(state, (0.5, 0.5, 0.5))
         m.color.r = r
         m.color.g = g
         m.color.b = b
@@ -388,15 +244,15 @@ class BoundaryPurePursuit(Node):
 
 def main(args=None) -> None:
     rclpy.init(args=args)
-    node = BoundaryPurePursuit()
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
+    node = LaneTracer()
+    pool = MultiThreadedExecutor()
+    pool.add_node(node)
     try:
-        executor.spin()
+        pool.spin()
     except KeyboardInterrupt:
         pass
     finally:
-        node._publish_drive(0.0, 0.0)
+        node._send_drive(0.0, 0.0)
         node.destroy_node()
         rclpy.shutdown()
 
