@@ -19,13 +19,11 @@ from vs_msgs.msg import ConeLocationPixel
 
 
 # Names must match Ultralytics COCO labels exactly (with spaces).
-TARGET_CLASSES = {"parking meter", "fire hydrant", "traffic light", "person"}
+TARGET_CLASSES = {"parking meter", "fire hydrant"}
 
 CLASS_COLORS = {
     "parking meter": (0, 255, 0),
     "fire hydrant":  (0, 0, 255),
-    "traffic light": (255, 255, 0),
-    "person":        (255, 0, 255),
 }
 
 
