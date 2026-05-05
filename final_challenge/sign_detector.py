@@ -51,7 +51,7 @@ class SignDetectorNode(Node):
             .get_parameter_value().double_value
         )
         self.save_dir = (
-            self.declare_parameter("save_dir", "/home/racecar/sign_detections")
+            self.declare_parameter("save_dir", "/root/racecar_ws/src/final_challenge2026/final_challenge/sign_detections")
             .get_parameter_value().string_value
         )
 
