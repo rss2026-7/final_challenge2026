@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Live YOLO preview on a video file.
 
-Detects only: fire hydrant, parking meter, traffic light, person.
-Fire hydrants and parking meters are highlighted in red.
+Detects only: fire hydrant, parking meter, backpack, bottle, traffic light, person.
+Fire hydrants, parking meters, backpacks, and bottles are highlighted in red.
+(COCO has a single "bottle" class — water bottles fall under it.)
 
-Usage: python yolo_preview.py [path/to/video] [--model yolov8s.pt] [--conf 0.25]
+Usage: python yolo_preview.py path/to/video [--model yolov8s.pt] [--conf 0.25]
 """
 import argparse
 import sys
@@ -14,11 +15,13 @@ from pathlib import Path
 import cv2
 from ultralytics import YOLO
 
-# COCO class IDs we keep. Hydrant + meter are highlighted in red; the others
+# COCO class IDs we keep. Targets are highlighted in red; the others
 # (traffic light, person) draw in green for context. Anything else is hidden.
-HIGHLIGHT_CLASSES = {10: "fire hydrant", 12: "parking meter"}
+HIGHLIGHT_CLASSES = {10: "fire hydrant", 12: "parking meter",
+                     24: "backpack", 39: "bottle"}
 ALLOWED_CLASSES = {0: "person", 9: "traffic light",
-                   10: "fire hydrant", 12: "parking meter"}
+                   10: "fire hydrant", 12: "parking meter",
+                   24: "backpack", 39: "bottle"}
 
 # OpenCV ignores QuickTime rotation metadata and gives us the raw landscape
 # buffer. iPhone clips are filmed portrait with rotation=-90 — rotate 90° CW to
@@ -33,8 +36,7 @@ ROTATE_MODES = {
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("video", nargs="?", default="IMG_7028.MOV",
-                   help="Path to the input video (default: IMG_7028.MOV)")
+    p.add_argument("video", help="Path to the input video")
     p.add_argument("--model", default="yolov8s.pt",
                    help="Ultralytics model weights (default: yolov8s.pt — small but more stable than n)")
     p.add_argument("--conf", type=float, default=0.25,
