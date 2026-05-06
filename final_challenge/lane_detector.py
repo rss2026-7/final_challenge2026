@@ -19,13 +19,11 @@ Pipeline (single image callback):
         ▼  Reject implausible angles
         │  Pick innermost left + innermost right boundary
         ▼
-    Intersect the two boundary lines in image space
+    Intersect each ground-frame boundary with x = LOOKAHEAD_GROUND_X_M
         │
-        ▼  Walk the angle bisector from the intersection
-        │  toward the car a fixed pixel distance
+        ▼  Average the two intersection y's → ground midpoint
         ▼
-    Project that pixel back to ground plane → publish as Point32
-    on /lookahead_point
+    Publish (LOOKAHEAD_GROUND_X_M, y_mid) as Point32 on /lookahead_point
 
 Topics
 ------
@@ -38,7 +36,7 @@ Publishes:
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -78,8 +76,7 @@ CLUSTER_ANG_DEG = 10.0
 GROUND_ANGLE_FLOOR_DEG = -15.0
 GROUND_ANGLE_CEIL_DEG  =  60.0
 
-LOOKAHEAD_BISECTOR_PX  = 50.0  # walk this many pixels from intersection
-LOOKAHEAD_FALLBACK_X   = 1.5   # m forward, used when the geometry breaks
+LOOKAHEAD_GROUND_X_M   = 0.6   # ground-frame forward distance for the midpoint
 
 
 # ───────────────────────────── geometry helpers ──────────────────────────
@@ -105,42 +102,6 @@ def _point_to_segment(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
     t = float(np.dot(p - a, ab)) / L2
     t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
     return float(np.linalg.norm(p - (a + t * ab)))
-
-
-def _line_intersection_2d(seg_a: Sequence[float],
-                          seg_b: Sequence[float]
-                          ) -> Optional[Tuple[float, float]]:
-    """Intersect two infinite lines defined by their endpoints.  None when
-    parallel/coincident."""
-    x1, y1, x2, y2 = seg_a
-    x3, y3, x4, y4 = seg_b
-    A1 = y2 - y1; B1 = x1 - x2; C1 = x2 * y1 - x1 * y2
-    A2 = y4 - y3; B2 = x3 - x4; C2 = x4 * y3 - x3 * y4
-    det = A1 * B2 - A2 * B1
-    if abs(det) < 1e-9:
-        return None
-    return ((B1 * C2 - B2 * C1) / det,
-            (C1 * A2 - C2 * A1) / det)
-
-
-def _angle_bisector_step(apex: Tuple[float, float],
-                         arm_a: Tuple[float, float],
-                         arm_b: Tuple[float, float],
-                         step_px: float) -> Tuple[float, float]:
-    """From apex, take step_px along the angle bisector of the two arms."""
-    ap = np.asarray(apex, dtype=float)
-    va = np.asarray(arm_a, dtype=float) - ap
-    vb = np.asarray(arm_b, dtype=float) - ap
-    na = float(np.linalg.norm(va)); nb = float(np.linalg.norm(vb))
-    if na < 1e-9 or nb < 1e-9:
-        return float(ap[0]), float(ap[1])
-    bisect = va / na + vb / nb
-    norm = float(np.linalg.norm(bisect))
-    if norm < 1e-9:
-        return float(ap[0]), float(ap[1])
-    bisect /= norm
-    end = ap + step_px * bisect
-    return float(end[0]), float(end[1])
 
 
 # ───────────────────────────── line clustering ───────────────────────────
@@ -363,27 +324,54 @@ class WhiteLineHunter(Node):
     # ── stage 2: lookahead point from the two boundary lines ────────────
     def _derive_lookahead(self, left_pix, right_pix
                           ) -> Tuple[float, float, Optional[Tuple[float, float]]]:
-        """Compute (x_car, y_car, uv) of the lookahead.  Falls through to
-        a forward-axis fallback when geometry is unavailable."""
+        """Compute (x_car, y_car, uv) of the lookahead as the ground-frame
+        midpoint of the two boundaries at x = LOOKAHEAD_GROUND_X_M.
+
+        Each boundary segment is projected to the ground plane, then we
+        intersect each ground line with x = L_x and average the two y's.
+        This is invariant to perspective foreshortening and avoids the
+        vanishing-point sensitivity of the angle-bisector approach.
+        """
         if left_pix is None or right_pix is None:
             return 0.0, 0.0, None
 
-        apex = _line_intersection_2d(left_pix, right_pix)
-        if apex is None:
+        L_x = LOOKAHEAD_GROUND_X_M
+
+        def _y_at_Lx(seg):
+            x1, y1, x2, y2 = seg
+            (gx1, gy1) = transform_uv_to_xy(self._H, x1, y1)
+            (gx2, gy2) = transform_uv_to_xy(self._H, x2, y2)
+            dx = gx2 - gx1
+            if abs(dx) < 1e-6:
+                return None
+            t = (L_x - gx1) / dx
+            return gy1 + t * (gy2 - gy1)
+
+        y_left  = _y_at_Lx(left_pix)
+        y_right = _y_at_Lx(right_pix)
+        if y_left is None or y_right is None:
+            return 0.0, 0.0, None
+        if not (math.isfinite(y_left) and math.isfinite(y_right)):
             return 0.0, 0.0, None
 
-        # Walk the bisector toward the car (away from the apex) using the
-        # *near* endpoints of the two boundary lines as the angle arms.
-        u_target, v_target = _angle_bisector_step(
-            apex,
-            (right_pix[0], right_pix[1]),
-            (left_pix[0],  left_pix[1]),
-            LOOKAHEAD_BISECTOR_PX,
-        )
-        x, y = transform_uv_to_xy(self._H, u_target, v_target)
-        if not (math.isfinite(x) and math.isfinite(y)):
+        y_mid = 0.5 * (y_left + y_right)
+        if not math.isfinite(y_mid):
             return 0.0, 0.0, None
-        return float(x), float(y), (float(u_target), float(v_target))
+
+        # Map (L_x, y_mid) back to image space for debug viz.
+        target_uv = self._ground_to_uv(L_x, y_mid)
+        return float(L_x), float(y_mid), target_uv
+
+    def _ground_to_uv(self, x_m: float, y_m: float
+                      ) -> Optional[Tuple[float, float]]:
+        try:
+            p = self._H_inv @ np.array([[x_m], [y_m], [1.0]])
+            w = float(p[2, 0])
+            if abs(w) < 1e-9:
+                return None
+            return float(p[0, 0] / w), float(p[1, 0] / w)
+        except Exception:
+            return None
 
     # ── publishers ───────────────────────────────────────────────────────
     def _publish_lookahead(self, x_car: float, y_car: float) -> None:

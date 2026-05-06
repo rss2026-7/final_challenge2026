@@ -39,6 +39,13 @@ PTS_GROUND_PLANE = [[88.00, 14.00],
 
 METERS_PER_CM = 0.01
 
+# Optical-axis column of the rectified ZED stream (672x376). Used to
+# subtract the y-bias the raw calibration points induce at the image
+# centerline — the four PTS_IMAGE_PLANE entries are not L/R-symmetric,
+# so a pixel at (IMAGE_OPTICAL_CENTER_U, v) maps to non-zero y in car
+# frame. We zero that bias post-hoc so straight-ahead == y=0.
+IMAGE_OPTICAL_CENTER_U = 336.0
+
 # used for lane_detector
 def build_homography():
     """Build and return the 3x3 homography matrix from the calibration points above."""
@@ -48,17 +55,28 @@ def build_homography():
     return H
 
 
+def _raw_uv_to_xy(H, u, v):
+    p = np.dot(H, np.array([[u], [v], [1.0]]))
+    scale = 1.0 / p[2, 0]
+    return float(p[0, 0] * scale), float(p[1, 0] * scale)
+
+
 def transform_uv_to_xy(H, u, v):
     """
     Transform an image pixel (u, v) to car-frame (x, y) in metres using H.
+
+    Applies a per-row y-bias correction so that the optical-axis column
+    (u = IMAGE_OPTICAL_CENTER_U) maps to y = 0 — i.e. a pixel at the
+    image's optical centerline is reported as straight ahead, regardless
+    of any L/R asymmetry in the calibration data.
 
     u, v : pixel coordinates — origin top-left, u right, v down.
     x    : metres forward from the car.
     y    : metres left of the car.
     """
-    p = np.dot(H, np.array([[u], [v], [1.0]]))
-    scale = 1.0 / p[2, 0]
-    return float(p[0, 0] * scale), float(p[1, 0] * scale)
+    x, y = _raw_uv_to_xy(H, u, v)
+    _, y_bias = _raw_uv_to_xy(H, IMAGE_OPTICAL_CENTER_U, v)
+    return x, y - y_bias
 
 
 class HomographyTransformer(Node):

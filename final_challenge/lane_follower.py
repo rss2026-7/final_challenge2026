@@ -67,17 +67,17 @@ class LaneTracer(Node):
         # ── geometry & pursuit gains (mirrors the racetrack reference) ──
         self.declare_parameter("wheelbase_m", 0.33)
         self.declare_parameter("pursuit_radius_default_m", 4.0)
-        self.declare_parameter("pursuit_radius_corner_m",  1.5)
+        self.declare_parameter("pursuit_radius_corner_m",  6.0)
         self.declare_parameter("pursuit_radius_tangent_m", 3.5)
         self.declare_parameter("eta_corner_deadband_rad",  0.2)
         self.declare_parameter("camera_lateral_offset_m",  0.0)
 
         # ── safety & cadence ─────────────────────────────────────────────
-        self.declare_parameter("cruise_speed_mps",   2.5)
+        self.declare_parameter("cruise_speed_mps",   4.1)
         self.declare_parameter("max_steering_rad",   0.34)
         self.declare_parameter("freshness_window_s", 0.80)
         self.declare_parameter("tick_rate_hz",       33.0)
-        self.declare_parameter("idle_when_blind",    True)
+        self.declare_parameter("idle_when_blind",    False)
 
         self._refresh_tunables()
 
