@@ -65,8 +65,9 @@ import numpy as np
 try:
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import qos_profile_sensor_data
     from cv_bridge import CvBridge
-    from sensor_msgs.msg import Image, RegionOfInterest
+    from sensor_msgs.msg import Image
     from std_msgs.msg import String
     _ROS_AVAILABLE = True
 except ImportError:
@@ -266,23 +267,32 @@ def _draw_yolo_detections(bgr, detections):
 # ── ROS2 node ────────────────────────────────────────────────────────────────
 class StoplightDetector(Node):
     """
-    Assumes yolo_node.py is running and publishing the traffic-light ROI.
-    Each frame is cropped to the latest traffic-light bbox before HSV
-    segmentation; if no valid bbox has arrived within `roi_timeout_sec`,
-    the node skips analysis and publishes "none".
+    Subscribes only to the cropped traffic-light frame from yolo_node.
 
-    Subscriptions
-    -------------
-    /zed/zed_node/rgb/image_rect_color (sensor_msgs/Image) — overridable via
-        the `image_topic` parameter.
-    /yolo/traffic_light/roi (sensor_msgs/RegionOfInterest) — overridable via
-        the `traffic_light_roi_topic` parameter.
+    The crop is published by yolo_node as `/yolo/traffic_light/image` with
+    the same header.stamp as the source ZED frame YOLO ran on. Running
+    HSV directly on it removes the bbox-vs-image race that the previous
+    "subscribe to raw image + ROI separately" design suffered: the bbox
+    and the pixels we segment are guaranteed to come from the same frame.
+
+    Detection lifecycle
+    -------------------
+    Each cropped image arriving on `/yolo/traffic_light/image` triggers
+    one HSV pass. The result ("red", "green", or "none") is published on
+    `/stoplight/result` and the segmented preview on `/stoplight/segmented`.
+
+    A watchdog timer publishes "none" on `/stoplight/result` whenever no
+    crop has arrived within `watchdog_sec` seconds (default 1.0s) — this
+    is how downstream learns "YOLO is not seeing a traffic light right
+    now", since yolo_node skips publishing the crop topic on frames where
+    the class is not detected. The safety_node's stoplight latch handles
+    the "we just saw red and YOLO briefly dropped" case; the watchdog
+    handles the "YOLO has been silent for a while".
 
     Publications
     ------------
     /stoplight/result      (std_msgs/String)    "red" | "green" | "none"
-    /stoplight/segmented   (sensor_msgs/Image)  debug — red+green pixels only,
-        zeroed outside the active ROI.
+    /stoplight/segmented   (sensor_msgs/Image)  debug — red+green pixels only
 
     HSV bounds and the min_area threshold are exposed as parameters so they
     can be tuned at launch time without editing the source.
@@ -291,18 +301,13 @@ class StoplightDetector(Node):
     def __init__(self):
         super().__init__("stoplight_detector")
 
-        self.image_topic = (
-            self.declare_parameter("image_topic",
-                                   "/zed/zed_node/rgb/image_rect_color")
+        self.crop_topic = (
+            self.declare_parameter("crop_topic",
+                                   "/yolo/traffic_light/image")
             .get_parameter_value().string_value
         )
-        self.roi_topic = (
-            self.declare_parameter("traffic_light_roi_topic",
-                                   "/yolo/traffic_light/roi")
-            .get_parameter_value().string_value
-        )
-        self.roi_timeout_sec = (
-            self.declare_parameter("roi_timeout_sec", 2.0)
+        self.watchdog_sec = (
+            self.declare_parameter("watchdog_sec", 1.0)
             .get_parameter_value().double_value
         )
 
@@ -324,20 +329,18 @@ class StoplightDetector(Node):
         )
 
         self.bridge = CvBridge()
+        self._last_crop_time = None  # rclpy.time.Time of last crop arrival
 
-        self._latest_roi = None        # (x, y, w, h) — most recent valid bbox
-        self._latest_roi_stamp = None  # rclpy.time.Time when it arrived
-
-        self.create_subscription(Image, self.image_topic, self._image_cb, 5)
         self.create_subscription(
-            RegionOfInterest, self.roi_topic, self._roi_cb, 10)
+            Image, self.crop_topic, self._crop_cb, qos_profile_sensor_data)
         self.result_pub = self.create_publisher(String, "/stoplight/result",    10)
         self.seg_pub    = self.create_publisher(Image,  "/stoplight/segmented", 10)
+        # 5 Hz watchdog — emits "none" if no crop arrived in watchdog_sec.
+        self.create_timer(0.2, self._watchdog_cb)
 
         self.get_logger().info(
-            f"StoplightDetector ready — image={self.image_topic}, "
-            f"roi={self.roi_topic}, roi_timeout={self.roi_timeout_sec}s, "
-            f"min_area={self.min_area}")
+            f"StoplightDetector ready — crop_topic={self.crop_topic}, "
+            f"watchdog={self.watchdog_sec}s, min_area={self.min_area}")
 
     def _declare_hsv(self, name, default):
         val = list(
@@ -351,59 +354,37 @@ class StoplightDetector(Node):
             return list(default)
         return val
 
-    def _roi_cb(self, msg: RegionOfInterest):
-        # yolo_node publishes width=0/height=0 for "no detection this frame";
-        # only treat non-empty boxes as a fresh bbox and reset the stale clock.
-        if msg.width == 0 or msg.height == 0:
-            return
-        self._latest_roi = (
-            int(msg.x_offset), int(msg.y_offset),
-            int(msg.width),    int(msg.height),
-        )
-        self._latest_roi_stamp = self.get_clock().now()
-        self.get_logger().info(
-            f"traffic_light bbox: x={msg.x_offset} y={msg.y_offset} "
-            f"w={msg.width} h={msg.height}")
-
-    def _current_roi(self):
-        """Return the latest bbox if it arrived within the timeout, else None."""
-        if self._latest_roi is None or self._latest_roi_stamp is None:
-            return None
-        elapsed = (self.get_clock().now() - self._latest_roi_stamp).nanoseconds / 1e9
-        if elapsed > self.roi_timeout_sec:
-            return None
-        return self._latest_roi
-
-    def _image_cb(self, msg: Image):
+    def _crop_cb(self, msg: Image):
         try:
-            bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            crop = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as e:
             self.get_logger().error(f"cv_bridge failed: {e}")
             return
 
-        roi = self._current_roi()
+        if crop.size == 0:
+            return
+
+        self._last_crop_time = self.get_clock().now()
+
+        masks, composite = segment_lights(crop, self.ranges)
         result_msg = String()
-        composite = np.zeros_like(bgr)
-
-        if roi is not None:
-            h_img, w_img = bgr.shape[:2]
-            x, y, w, h = roi
-            x = max(0, min(x, w_img - 1))
-            y = max(0, min(y, h_img - 1))
-            w = max(1, min(w, w_img - x))
-            h = max(1, min(h, h_img - y))
-            crop = bgr[y:y + h, x:x + w]
-
-            masks, crop_composite = segment_lights(crop, self.ranges)
-            composite[y:y + h, x:x + w] = crop_composite
-            result_msg.data = detect_color(masks, self.min_area) or "none"
-        else:
-            result_msg.data = "none"
-
+        result_msg.data = detect_color(masks, self.min_area) or "none"
         self.result_pub.publish(result_msg)
+
         seg_msg = self.bridge.cv2_to_imgmsg(composite, encoding="bgr8")
         seg_msg.header = msg.header
         self.seg_pub.publish(seg_msg)
+
+    def _watchdog_cb(self):
+        """Publish "none" when the crop topic has been silent past the
+        watchdog window — covers the "YOLO sees no traffic light" case
+        since yolo_node only publishes the crop on detected frames."""
+        if self._last_crop_time is None:
+            self.result_pub.publish(String(data="none"))
+            return
+        elapsed = (self.get_clock().now() - self._last_crop_time).nanoseconds / 1e9
+        if elapsed > self.watchdog_sec:
+            self.result_pub.publish(String(data="none"))
 
 
 def main(args=None):

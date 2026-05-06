@@ -39,13 +39,18 @@
     <param name="drive_topic" value="/drive"/>
   </node>
 
-  <!-- ── Sign detector (also publishes /relative_cone_px for parking) ── -->
-  <node pkg="final_challenge" exec="sign_detector" output="screen">
+  <!-- ── Central YOLO inference (every other perception node listens
+       to its outputs; running it twice would race the bbox vs frame). ── -->
+  <node pkg="final_challenge" exec="yolo_node" output="screen">
     <param name="model" value="/home/racecar/racecar_ws/yolo11n.pt"/>
   </node>
 
+  <!-- ── Sign detector (publishes /relative_cone_px; pure consumer of
+       /yolo/parking_meter/roi + /yolo/fire_hydrant/roi). ── -->
+  <node pkg="final_challenge" exec="sign_detector" output="screen"/>
 
-  <!-- ── Traffic light detector ── -->
+
+  <!-- ── Traffic-light detector (HSV on /yolo/traffic_light/image). ── -->
   <node pkg="final_challenge" exec="stoplight_detection" output="screen">
   </node>
 

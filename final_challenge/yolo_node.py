@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-yolo_node.py — generic YOLO inference ROS2 node.
+yolo_node.py — central YOLO inference for the perception stack.
 
 Runs YOLO once per incoming camera frame and publishes per-class bounding
-boxes plus an annotated debug image.  Downstream nodes (e.g.
-stoplight_detection) subscribe to a single class's ROI topic and crop
-their input to that region instead of running YOLO themselves.
+boxes, per-class cropped images, and an annotated debug image.  Every
+downstream perception node (stoplight_detection, sign_detector, the
+safety controller's person check) consumes ONLY this node's outputs —
+nobody else runs YOLO and nobody re-crops the source image, which would
+race the bbox against a newer frame.
 
 Topology
 --------
 Subscribes:
   <image_topic>  sensor_msgs/Image
       Default /zed/zed_node/rgb/image_rect_color (override via the
-      `image_topic` parameter).
+      `image_topic` parameter).  Subscription QoS is sensor_data
+      (BEST_EFFORT, depth 1) to match the ZED publisher and stop frames
+      from queueing behind a slow YOLO inference under load.
 
 Publishes:
   /yolo/<class>/roi         sensor_msgs/RegionOfInterest
@@ -21,15 +25,15 @@ Publishes:
       width == 0 or height == 0 means "not detected this frame" — published
       every frame so consumers can distinguish "no detection now" from
       "stale, no message yet".
+  /yolo/<class>/image       sensor_msgs/Image
+      The current source frame cropped to <class>'s highest-confidence
+      bbox.  Published ONLY on frames where the class is detected — its
+      header.stamp matches the source frame, so downstream HSV /
+      classification work is guaranteed to run on the same pixels YOLO
+      saw the object in.  Consumers should treat "no message arrived
+      within K seconds" as "not detected" via a watchdog timer.
   /yolo/annotated_image     sensor_msgs/Image
       The input frame with every surviving box drawn on it.
-
-Sibling node
-------------
-sign_detector.py keeps its trigger / one-shot / disk-save behavior and
-runs YOLO independently.  This node is duplicate inference today; if that
-becomes a cost concern, sign_detector can be retargeted to subscribe to
-this node's outputs.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ import rclpy
 import torch
 from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, RegionOfInterest
 from ultralytics import YOLO
 
@@ -88,8 +93,12 @@ class YoloNode(Node):
             .get_parameter_value().string_value
         )
         self.conf_threshold = (
-            self.declare_parameter("conf_threshold", 0.1)
+            self.declare_parameter("conf_threshold", 0.25)
             .get_parameter_value().double_value
+        )
+        self.imgsz = (
+            self.declare_parameter("imgsz", 960)
+            .get_parameter_value().integer_value
         )
 
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -103,23 +112,33 @@ class YoloNode(Node):
 
         self.bridge = CvBridge()
 
-        self.create_subscription(Image, self.image_topic, self._image_cb, 5)
+        self.create_subscription(
+            Image, self.image_topic, self._image_cb, qos_profile_sensor_data)
         self.roi_pubs: Dict[str, rclpy.publisher.Publisher] = {
             name: self.create_publisher(
                 RegionOfInterest, f"/yolo/{_topic_safe(name)}/roi", 10)
             for name in TARGET_CLASSES
         }
+        self.crop_pubs: Dict[str, rclpy.publisher.Publisher] = {
+            name: self.create_publisher(
+                Image, f"/yolo/{_topic_safe(name)}/image", qos_profile_sensor_data)
+            for name in TARGET_CLASSES
+        }
         self.annotated_pub = self.create_publisher(
-            Image, "/yolo/annotated_image", 10)
+            Image, "/yolo/annotated_image", qos_profile_sensor_data)
 
         self.get_logger().info(
             f"YoloNode ready — image={self.image_topic}, "
             f"model={self.model_name}, device={self.device}, "
-            f"conf>={self.conf_threshold}"
+            f"conf>={self.conf_threshold}, imgsz={self.imgsz}"
         )
         self.get_logger().info(
-            f"Per-class topics: "
+            f"Per-class ROI topics: "
             f"{sorted(p.topic_name for p in self.roi_pubs.values())}"
+        )
+        self.get_logger().info(
+            f"Per-class crop topics: "
+            f"{sorted(p.topic_name for p in self.crop_pubs.values())}"
         )
 
     def _image_cb(self, msg: Image) -> None:
@@ -134,6 +153,7 @@ class YoloNode(Node):
                 bgr,
                 classes=self.allowed_cls,
                 conf=self.conf_threshold,
+                imgsz=self.imgsz,
                 verbose=False,
             )
         except Exception as e:
@@ -149,7 +169,7 @@ class YoloNode(Node):
                 best_per_class[det.class_name] = det
 
         h, w = bgr.shape[:2]
-        for name, pub in self.roi_pubs.items():
+        for name, roi_pub in self.roi_pubs.items():
             roi = RegionOfInterest()
             det = best_per_class.get(name)
             if det is not None:
@@ -161,7 +181,12 @@ class YoloNode(Node):
                 roi.y_offset = y1
                 roi.width    = max(0, x2 - x1)
                 roi.height   = max(0, y2 - y1)
-            pub.publish(roi)
+                if roi.width > 0 and roi.height > 0:
+                    crop = bgr[y1:y2, x1:x2]
+                    crop_msg = self.bridge.cv2_to_imgmsg(crop, encoding="bgr8")
+                    crop_msg.header = msg.header
+                    self.crop_pubs[name].publish(crop_msg)
+            roi_pub.publish(roi)
 
         annotated = self._draw_detections(bgr, dets)
         out_msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")

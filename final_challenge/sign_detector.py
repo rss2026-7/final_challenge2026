@@ -1,90 +1,132 @@
 #!/usr/bin/env python3
+"""
+sign_detector.py — pure consumer of yolo_node outputs.
+
+Watches yolo_node's per-class ROI topics for parking_meter and
+fire_hydrant.  Runs no YOLO inference of its own and never reads the
+raw camera image — every pixel it touches comes from yolo_node, so
+there is no race between bbox and source frame.
+
+Behaviors
+---------
+1. Continuous (whenever `/sign_detection/trigger` is True): every time
+   `/yolo/parking_meter/roi` arrives non-empty, republish the bbox's
+   bottom-center as ConeLocationPixel on `/relative_cone_px` for the
+   parking controller's visual servo.
+
+2. One-shot (whenever `/sign_detection/trigger` is True, until the next
+   `False` resets it): on the first frame where either parking_meter or
+   fire_hydrant is detected, pick the larger-area bbox, publish the
+   class name on `/sign_detection/result`, and save the most recent
+   `/yolo/annotated_image` to disk under `save_dir`.
+
+3. Live debug feed: while triggered, the latest `/yolo/annotated_image`
+   is rebroadcast on `/sign_detection/live_feed` so existing RViz/foxglove
+   layouts keep working.
+
+The trigger Bool gates ALL publishing; toggling it back to False also
+re-arms the one-shot for the next leg.
+"""
 
 import os
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
+
 import cv2
 import numpy as np
 import rclpy
-import torch
-
-from dataclasses import dataclass
-from datetime import datetime
-from typing import List
-
-from rclpy.node import Node
-from sensor_msgs.msg import Image
-from std_msgs.msg import Bool, String
 from cv_bridge import CvBridge
-from ultralytics import YOLO
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image, RegionOfInterest
+from std_msgs.msg import Bool, String
 from vs_msgs.msg import ConeLocationPixel
 
 
-# Names must match Ultralytics COCO labels exactly (with spaces).
-TARGET_CLASSES = {"parking meter", "fire hydrant"}
-
-CLASS_COLORS = {
-    "parking meter": (0, 255, 0),
-    "fire hydrant":  (0, 0, 255),
-}
+# Class names follow yolo_node's TARGET_CLASSES (Ultralytics COCO labels).
+# Topic suffixes replace spaces with underscores, matching yolo_node's
+# `_topic_safe()`.
+WATCHED_CLASSES = ("parking meter", "fire hydrant")
 
 
-@dataclass(frozen=True)
-class Detection:
-    class_id: int
-    class_name: str
-    confidence: float
-    x1: int
-    y1: int
-    x2: int
-    y2: int
+def _topic_safe(name: str) -> str:
+    return name.replace(" ", "_")
+
+
+@dataclass
+class RoiSnapshot:
+    x_offset: int
+    y_offset: int
+    width: int
+    height: int
+
+    @property
+    def area(self) -> int:
+        return int(self.width) * int(self.height)
+
+    @property
+    def u_center(self) -> float:
+        return float(self.x_offset) + float(self.width) / 2.0
+
+    @property
+    def v_bottom(self) -> float:
+        return float(self.y_offset) + float(self.height)
 
 
 class SignDetectorNode(Node):
     def __init__(self) -> None:
         super().__init__("sign_detector")
 
-        self.model_name = (
-            self.declare_parameter("model", "yolo11n.pt")
-            .get_parameter_value().string_value
-        )
-        self.conf_threshold = (
-            self.declare_parameter("conf_threshold", 0.5)
-            .get_parameter_value().double_value
-        )
         self.save_dir = (
-            self.declare_parameter("save_dir", "/root/racecar_ws/src/final_challenge2026/final_challenge/sign_detections")
+            self.declare_parameter(
+                "save_dir",
+                "/root/racecar_ws/src/final_challenge2026/final_challenge/sign_detections",
+            )
             .get_parameter_value().string_value
         )
-
         os.makedirs(self.save_dir, exist_ok=True)
-
-        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        self.model = YOLO(self.model_name)
-        self.model.to(self.device)
-
-        self.allowed_cls = [
-            i for i, name in self.model.names.items()
-            if name in TARGET_CLASSES
-        ]
 
         self.bridge = CvBridge()
         self.active = False
         self.result_published = False
 
-        self.img_sub = self.create_subscription(
-            Image, "/zed/zed_node/rgb/image_rect_color", self._image_cb, 10)
-        self.trigger_sub = self.create_subscription(
-            Bool, "/sign_detection/trigger", self._trigger_cb, 10)
+        # Latest non-empty bbox per watched class. None when the class is
+        # not currently detected; set on every fresh non-empty ROI message.
+        self._latest_roi: dict[str, Optional[RoiSnapshot]] = {
+            name: None for name in WATCHED_CLASSES
+        }
+        # Latest annotated frame from yolo_node — used for the saved-on-trigger
+        # snapshot and the live-feed passthrough.
+        self._latest_annotated: Optional[Image] = None
+
+        for name in WATCHED_CLASSES:
+            topic = f"/yolo/{_topic_safe(name)}/roi"
+            self.create_subscription(
+                RegionOfInterest, topic,
+                lambda msg, n=name: self._roi_cb(msg, n), 10,
+            )
+
+        self.create_subscription(
+            Image, "/yolo/annotated_image", self._annotated_cb,
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            Bool, "/sign_detection/trigger", self._trigger_cb, 10,
+        )
 
         self.result_pub = self.create_publisher(String, "/sign_detection/result", 10)
-        self.annotated_pub = self.create_publisher(Image, "/sign_detection/annotated_image", 10)
-        self.live_feed_pub = self.create_publisher(Image, "/sign_detection/live_feed", 10)
-        self.cone_px_pub = self.create_publisher(ConeLocationPixel, "/relative_cone_px", 10)
+        self.annotated_pub = self.create_publisher(
+            Image, "/sign_detection/annotated_image", 10)
+        self.live_feed_pub = self.create_publisher(
+            Image, "/sign_detection/live_feed", qos_profile_sensor_data)
+        self.cone_px_pub = self.create_publisher(
+            ConeLocationPixel, "/relative_cone_px", 10)
 
         self.get_logger().info(
-            f"SignDetector ready — model={self.model_name}, device={self.device}, "
-            f"conf={self.conf_threshold}, save_dir={self.save_dir}"
+            f"SignDetector ready — listening to yolo_node only. "
+            f"watched={list(WATCHED_CLASSES)}, save_dir={self.save_dir}"
         )
-        self.get_logger().info(f"Watching class IDs: {self.allowed_cls}")
 
     def _trigger_cb(self, msg: Bool) -> None:
         if msg.data:
@@ -92,116 +134,93 @@ class SignDetectorNode(Node):
             self.get_logger().info("Detection triggered.")
         else:
             self.active = False
+            # Re-arm the one-shot for the next leg.
+            self.result_published = False
 
-    def _image_cb(self, msg: Image) -> None:
+    def _annotated_cb(self, msg: Image) -> None:
+        self._latest_annotated = msg
+        if self.active:
+            self.live_feed_pub.publish(msg)
+
+    def _roi_cb(self, msg: RegionOfInterest, class_name: str) -> None:
+        # yolo_node publishes width=0/height=0 every frame the class is
+        # not detected, so absence-of-detection naturally clears the slot.
+        if msg.width == 0 or msg.height == 0:
+            self._latest_roi[class_name] = None
+            return
+
+        snap = RoiSnapshot(
+            x_offset=int(msg.x_offset),
+            y_offset=int(msg.y_offset),
+            width=int(msg.width),
+            height=int(msg.height),
+        )
+        self._latest_roi[class_name] = snap
+
         if not self.active:
             return
 
-        try:
-            bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        except Exception as e:
-            self.get_logger().error(f"cv_bridge failed: {e}")
-            return
-
-        try:
-            results = self.model(
-                bgr,
-                classes=self.allowed_cls,
-                conf=self.conf_threshold,
-                verbose=False,
-            )
-        except Exception as e:
-            self.get_logger().error(f"YOLO inference failed: {e}")
-            return
-
-        if not results:
-            return
-
-        dets = self._results_to_detections(results[0])
-
-        # Always publish live feed with all detections drawn
-        live = self._draw_all_detections(bgr, dets)
-        live_msg = self.bridge.cv2_to_imgmsg(live, encoding="bgr8")
-        live_msg.header = msg.header
-        self.live_feed_pub.publish(live_msg)
-
-        if not dets:
-            return
-
-        best = max(dets, key=lambda d: d.confidence)
-
-        # Continuous: publish pixel location every frame for parking controller servo
-        if best.class_name == "parking meter":
+        # Continuous: feed the parking controller a pixel target every
+        # frame parking_meter is visible. Bottom-center matches the
+        # homography calibration used by homography_transformer.
+        if class_name == "parking meter":
             cone_px = ConeLocationPixel()
-            cone_px.u = float((best.x1 + best.x2) / 2)
-            cone_px.v = float(best.y2)  # bottom-center, matches homography calibration
+            cone_px.u = snap.u_center
+            cone_px.v = snap.v_bottom
             self.cone_px_pub.publish(cone_px)
 
-        # One-shot: publish class result and save annotated image
+        # One-shot: announce the class and save proof, once per trigger.
         if self.result_published:
             return
+        self._maybe_publish_one_shot()
 
-        annotated = self._draw_detection(bgr, best)
+    def _maybe_publish_one_shot(self) -> None:
+        """Pick the larger-area watched bbox currently visible and emit
+        the one-shot result + saved annotated frame. RegionOfInterest
+        messages don't carry confidence, so larger-area is the proxy for
+        "more confident / closer" when both classes are detected."""
+        candidates = [
+            (name, snap)
+            for name, snap in self._latest_roi.items()
+            if snap is not None
+        ]
+        if not candidates:
+            return
+        candidates.sort(key=lambda nc: nc[1].area, reverse=True)
+        best_name, best_snap = candidates[0]
+
+        if self._latest_annotated is None:
+            # Without an annotated frame we can still publish the result,
+            # but we can't save proof to disk. That's a soft failure: log
+            # and emit the class anyway so the state machine isn't blocked.
+            self.get_logger().warn(
+                f"Detected '{best_name}' but no /yolo/annotated_image "
+                f"received yet — publishing result without saving."
+            )
+            self.result_pub.publish(String(data=best_name))
+            self.result_published = True
+            return
+
+        try:
+            annotated_bgr = self.bridge.imgmsg_to_cv2(
+                self._latest_annotated, desired_encoding="bgr8")
+        except Exception as e:
+            self.get_logger().error(f"cv_bridge failed on annotated: {e}")
+            return
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        save_path = os.path.join(self.save_dir, f"{best.class_name}_{timestamp}.jpg")
-        cv2.imwrite(save_path, annotated)
+        save_path = os.path.join(
+            self.save_dir, f"{_topic_safe(best_name)}_{timestamp}.jpg")
+        cv2.imwrite(save_path, annotated_bgr)
 
-        result_msg = String()
-        result_msg.data = best.class_name
-        self.result_pub.publish(result_msg)
-
-        out_msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
-        out_msg.header = msg.header
-        self.annotated_pub.publish(out_msg)
-
+        self.result_pub.publish(String(data=best_name))
+        self.annotated_pub.publish(self._latest_annotated)
         self.result_published = True
+
         self.get_logger().info(
-            f"Detected '{best.class_name}' (conf={best.confidence:.2f}), saved to {save_path}"
+            f"Detected '{best_name}' (bbox={best_snap.width}x{best_snap.height}"
+            f"={best_snap.area}px), saved to {save_path}"
         )
-
-    def _results_to_detections(self, result) -> List[Detection]:
-        detections = []
-        if result.boxes is None:
-            return detections
-
-        xyxy = result.boxes.xyxy
-        conf = result.boxes.conf
-        cls = result.boxes.cls
-
-        xyxy_np = xyxy.detach().cpu().numpy() if hasattr(xyxy, "detach") else np.asarray(xyxy)
-        conf_np = conf.detach().cpu().numpy() if hasattr(conf, "detach") else np.asarray(conf)
-        cls_np  = cls.detach().cpu().numpy()  if hasattr(cls,  "detach") else np.asarray(cls)
-
-        for box, conf_val, cls_val in zip(xyxy_np, conf_np, cls_np):
-            detections.append(Detection(
-                class_id=int(cls_val),
-                class_name=self.model.names[int(cls_val)],
-                confidence=float(conf_val),
-                x1=int(box[0]),
-                y1=int(box[1]),
-                x2=int(box[2]),
-                y2=int(box[3]),
-            ))
-        return detections
-
-    def _draw_detection(self, bgr: np.ndarray, det: Detection) -> np.ndarray:
-        out = bgr.copy()
-        color = CLASS_COLORS.get(det.class_name, (255, 255, 255))
-        cv2.rectangle(out, (det.x1, det.y1), (det.x2, det.y2), color, 2)
-        label = f"{det.class_name} {det.confidence:.2f}"
-        cv2.putText(out, label, (det.x1, det.y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        return out
-
-    def _draw_all_detections(self, bgr: np.ndarray, dets: List[Detection]) -> np.ndarray:
-        out = bgr.copy()
-        for det in dets:
-            color = CLASS_COLORS.get(det.class_name, (255, 255, 255))
-            cv2.rectangle(out, (det.x1, det.y1), (det.x2, det.y2), color, 2)
-            label = f"{det.class_name} {det.confidence:.2f}"
-            cv2.putText(out, label, (det.x1, det.y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        return out
 
 
 def main() -> None:
@@ -214,3 +233,7 @@ def main() -> None:
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
