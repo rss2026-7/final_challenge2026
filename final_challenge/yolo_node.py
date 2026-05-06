@@ -3,11 +3,9 @@
 yolo_node.py — central YOLO inference for the perception stack.
 
 Runs YOLO once per incoming camera frame and publishes per-class bounding
-boxes, per-class cropped images, and an annotated debug image.  Every
-downstream perception node (stoplight_detection, sign_detector, the
-safety controller's person check) consumes ONLY this node's outputs —
-nobody else runs YOLO and nobody re-crops the source image, which would
-race the bbox against a newer frame.
+boxes plus an annotated debug image.  Every downstream perception node
+(stoplight_detection, sign_detector, the safety controller's person
+check) consumes ONLY this node's ROIs — nobody else runs YOLO.
 
 Topology
 --------
@@ -25,15 +23,9 @@ Publishes:
       width == 0 or height == 0 means "not detected this frame" — published
       every frame so consumers can distinguish "no detection now" from
       "stale, no message yet".
-  /yolo/<class>/image       sensor_msgs/Image
-      The current source frame cropped to <class>'s highest-confidence
-      bbox.  Published ONLY on frames where the class is detected — its
-      header.stamp matches the source frame, so downstream HSV /
-      classification work is guaranteed to run on the same pixels YOLO
-      saw the object in.  Consumers should treat "no message arrived
-      within K seconds" as "not detected" via a watchdog timer.
   /yolo/annotated_image     sensor_msgs/Image
-      The input frame with every surviving box drawn on it.
+      The input frame with every surviving box drawn on it.  Also serves
+      as the live debug feed for sign-detection and parking legs.
 """
 
 from __future__ import annotations
@@ -62,6 +54,11 @@ CLASS_COLORS = {
     "traffic light": (255, 255, 0),
     "person":        (255, 0, 255),
 }
+
+# Traffic-light bboxes whose bottom edge sits above this fraction of the
+# image height are dropped before being routed to the stoplight detector.
+# Keeps the stoplight HSV pass from chasing distant lights or sky reflections.
+STOPLIGHT_MIN_CENTER_Y_FRAC = 0.4
 
 
 @dataclass(frozen=True)
@@ -119,11 +116,6 @@ class YoloNode(Node):
                 RegionOfInterest, f"/yolo/{_topic_safe(name)}/roi", 10)
             for name in TARGET_CLASSES
         }
-        self.crop_pubs: Dict[str, rclpy.publisher.Publisher] = {
-            name: self.create_publisher(
-                Image, f"/yolo/{_topic_safe(name)}/image", qos_profile_sensor_data)
-            for name in TARGET_CLASSES
-        }
         self.annotated_pub = self.create_publisher(
             Image, "/yolo/annotated_image", qos_profile_sensor_data)
 
@@ -135,10 +127,6 @@ class YoloNode(Node):
         self.get_logger().info(
             f"Per-class ROI topics: "
             f"{sorted(p.topic_name for p in self.roi_pubs.values())}"
-        )
-        self.get_logger().info(
-            f"Per-class crop topics: "
-            f"{sorted(p.topic_name for p in self.crop_pubs.values())}"
         )
 
     def _image_cb(self, msg: Image) -> None:
@@ -162,13 +150,21 @@ class YoloNode(Node):
 
         dets = self._results_to_detections(results[0]) if results else []
 
+        h, w = bgr.shape[:2]
+        stoplight_y_threshold = int(STOPLIGHT_MIN_CENTER_Y_FRAC * h)
+
         best_per_class: Dict[str, Detection] = {}
         for det in dets:
+            if det.class_name == "traffic light":
+                # Bottom-center of the bbox is the reference point — high
+                # bboxes whose bottom edge stays above the threshold get
+                # dropped before they ever reach the stoplight detector.
+                if det.y2 < stoplight_y_threshold:
+                    continue
             cur = best_per_class.get(det.class_name)
             if cur is None or det.confidence > cur.confidence:
                 best_per_class[det.class_name] = det
 
-        h, w = bgr.shape[:2]
         for name, roi_pub in self.roi_pubs.items():
             roi = RegionOfInterest()
             det = best_per_class.get(name)
@@ -181,11 +177,6 @@ class YoloNode(Node):
                 roi.y_offset = y1
                 roi.width    = max(0, x2 - x1)
                 roi.height   = max(0, y2 - y1)
-                if roi.width > 0 and roi.height > 0:
-                    crop = bgr[y1:y2, x1:x2]
-                    crop_msg = self.bridge.cv2_to_imgmsg(crop, encoding="bgr8")
-                    crop_msg.header = msg.header
-                    self.crop_pubs[name].publish(crop_msg)
             roi_pub.publish(roi)
 
         annotated = self._draw_detections(bgr, dets)
@@ -221,6 +212,9 @@ class YoloNode(Node):
     def _draw_detections(self, bgr: np.ndarray,
                          dets: List[Detection]) -> np.ndarray:
         out = bgr.copy()
+        h, w = out.shape[:2]
+        line_y = int(STOPLIGHT_MIN_CENTER_Y_FRAC * h)
+        cv2.line(out, (0, line_y), (w - 1, line_y), (0, 0, 255), 2)
         for det in dets:
             color = CLASS_COLORS.get(det.class_name, (255, 255, 255))
             cv2.rectangle(out, (det.x1, det.y1), (det.x2, det.y2), color, 2)
@@ -228,6 +222,10 @@ class YoloNode(Node):
             cv2.putText(out, label,
                         (det.x1, max(12, det.y1 - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            if det.class_name == "traffic light":
+                bx = (det.x1 + det.x2) // 2
+                by = det.y2
+                cv2.circle(out, (bx, by), 5, (0, 0, 255), -1)
         return out
 
 

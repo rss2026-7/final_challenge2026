@@ -60,16 +60,17 @@ Calibration workflow: click `[Red 1]` → right-click a lit red bulb → click `
 | Name | Kind | Type | Default | Notes |
 |---|---|---|---|---|
 | `image_topic` | param | string | `/zed/zed_node/rgb/image_rect_color` | Camera topic |
+| `roi_topic` | param | string | `/yolo/traffic_light/roi` | Bbox source from yolo_node |
 | `red_low_1`, `red_high_1` | param | int[3] | `[0,120,90]`, `[10,255,255]` | HSV lower band of red |
 | `red_low_2`, `red_high_2` | param | int[3] | `[170,120,90]`, `[179,255,255]` | HSV upper band (red wraps the hue seam) |
-| `green_low`, `green_high` | param | int[3] | `[40,90,90]`, `[85,255,255]` | HSV band for green |
 | `min_area` | param | int | `50` | px² gate — largest contour must exceed this to count |
+| `watchdog_sec` | param | double | `1.0` | Time without a non-empty ROI before re-emitting `"none"` |
 | *(image_topic)* | sub | `sensor_msgs/Image` | — | Live camera frames |
+| *(roi_topic)* | sub | `sensor_msgs/RegionOfInterest` | — | yolo_node's traffic-light bbox |
 | *(positional CLI arg)* | arg | path | — | GUI mode only: image file or directory |
 
 ### Outputs
 
 | Topic | Type | Notes |
 |---|---|---|
-| `/stoplight/result` | `std_msgs/String` | `"red"`, `"green"`, or `"none"` per frame |
-| `/stoplight/segmented` | `sensor_msgs/Image` | Debug — input with only red+green pixels kept |
+| `/stoplight/result` | `std_msgs/String` | `"red"` or `"none"` per detected frame; `"none"` from watchdog otherwise |

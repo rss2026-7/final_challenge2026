@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Stoplight color segmentation — red & green light detection.
+Stoplight color segmentation — red light detection.
 
 Three pieces in this file:
   1. Pure helpers     — segment_lights / find_largest_blob / detect_color
-  2. ROS2 node        — StoplightDetector  (publishes "red" / "green" / "none")
+  2. ROS2 node        — StoplightDetector  (publishes "red" / "none")
   3. Calibration GUI  — fully mouse-driven HSV tuner (buttons + trackbars + ROI)
 
 Detection model
 ---------------
-A pixel passes the filter if it falls inside the per-color HSV bounds.
+A pixel passes the filter if it falls inside the red HSV bounds.
 A *detection* requires more than scattered passing pixels: the largest
-contiguous contour across both color masks must clear MIN_AREA.  This stops
+contiguous contour in the red mask must clear MIN_AREA.  This stops
 specular highlights, stray red car paint, etc. from triggering "red".
 
 How to calibrate (no keyboard shortcuts — everything is in the GUI)
@@ -29,19 +29,18 @@ How to calibrate (no keyboard shortcuts — everything is in the GUI)
          those pixels.  Right-click ONLY ever updates the currently active
          filter — it never switches the active filter on you.
       2. Click [Red 2] only if your red bulbs straddle the hue seam (rare).
-      3. Click [Green], right-click on a lit green bulb.
-      4. Tune the Min_Area threshold.  The RIGHT panel draws a box around
+      3. Tune the Min_Area threshold.  The RIGHT panel draws a box around
          every contour the active filter let through — thick when the area
          clears Min_Area, thin when it doesn't.  Drag the Min_Area
          trackbar so real bulbs become thick boxes and noise stays thin.
-      5. Click [Print Values]; paste the printed lines over the constants
+      4. Click [Print Values]; paste the printed lines over the constants
          at the top of this file.
 
     To verify on other images: re-run the script with a different path
     (e.g. `... testing_images/traffic_light/3.jpeg`).  No navigation buttons in the GUI.
 
     Manual tuning:
-      - Click [Red 1] / [Red 2] / [Green] to choose which interval the
+      - Click [Red 1] / [Red 2] to choose which interval the
         H_low/S_low/V_low/H_high/S_high/V_high trackbars edit.
       - Right panel updates live to show only the active interval's hits.
       - Left-click + drag on the LEFT panel to crop to the stoplight's
@@ -67,7 +66,7 @@ try:
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
     from cv_bridge import CvBridge
-    from sensor_msgs.msg import Image
+    from sensor_msgs.msg import Image, RegionOfInterest
     from std_msgs.msg import String
     _ROS_AVAILABLE = True
 except ImportError:
@@ -90,8 +89,6 @@ DEFAULT_RED_LOW_1   = [0, 0, 204]
 DEFAULT_RED_HIGH_1  = [86, 255, 255]
 DEFAULT_RED_LOW_2   = [170, 120, 90]
 DEFAULT_RED_HIGH_2  = [179, 255, 255]
-DEFAULT_GREEN_LOW   = [40, 90, 90]
-DEFAULT_GREEN_HIGH  = [85, 255, 255]
 MIN_AREA            = 50
 
 
@@ -137,9 +134,6 @@ def default_ranges():
             list(DEFAULT_RED_LOW_1),  list(DEFAULT_RED_HIGH_1),
             list(DEFAULT_RED_LOW_2),  list(DEFAULT_RED_HIGH_2),
         ],
-        "green": [
-            list(DEFAULT_GREEN_LOW),  list(DEFAULT_GREEN_HIGH),
-        ],
     }
 
 
@@ -158,13 +152,12 @@ def _clean(mask):
 
 def segment_lights(bgr, ranges=None):
     """
-    Build per-color masks + a composite image keeping only red + green pixels.
+    Build the red mask + a composite image keeping only red pixels.
 
     ranges schema:
       "red":   [low1, high1, low2, high2]   — two HSV intervals (hue wraps)
-      "green": [low, high]                  — one HSV interval
 
-    Returns ({"red": uint8 mask, "green": uint8 mask}, composite_bgr).
+    Returns ({"red": uint8 mask}, composite_bgr).
     """
     if ranges is None:
         ranges = default_ranges()
@@ -173,52 +166,43 @@ def segment_lights(bgr, ranges=None):
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
     rl1, rh1, rl2, rh2 = ranges["red"]
-    gl,  gh = ranges["green"]
 
-    red_mask   = _clean(cv2.bitwise_or(_inrange(hsv, rl1, rh1),
-                                       _inrange(hsv, rl2, rh2)))
-    green_mask = _clean(_inrange(hsv, gl, gh))
+    red_mask = _clean(cv2.bitwise_or(_inrange(hsv, rl1, rh1),
+                                     _inrange(hsv, rl2, rh2)))
 
-    masks = {"red": red_mask, "green": green_mask}
-    union = cv2.bitwise_or(red_mask, green_mask)
-    composite = cv2.bitwise_and(bgr, bgr, mask=union)
+    masks = {"red": red_mask}
+    composite = cv2.bitwise_and(bgr, bgr, mask=red_mask)
     return masks, composite
 
 
 def find_largest_blob(masks):
     """
     Return (color, area, bbox) for the single largest contiguous contour
-    across both color masks.
+    in the red mask.
 
-    color : "red" | "green" | None    (None ⇔ no contours at all)
+    color : "red" | None    (None ⇔ no contours at all)
     area  : int — px², 0 if nothing found
     bbox  : (x, y, w, h) or None
 
     Contour area (not pixel count) is used so a halo of scattered red noise
     doesn't sum up to a fake "patch."
     """
-    best_color = None
-    best_area = 0
-    best_bbox = None
-    for color in ("red", "green"):
-        contours, _ = cv2.findContours(masks[color],
-                                       cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
-        cnt = max(contours, key=cv2.contourArea)
-        area = int(cv2.contourArea(cnt))
-        if area > best_area:
-            best_color = color
-            best_area  = area
-            best_bbox  = cv2.boundingRect(cnt)
-    return best_color, best_area, best_bbox
+    contours, _ = cv2.findContours(masks["red"],
+                                   cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, 0, None
+    cnt = max(contours, key=cv2.contourArea)
+    area = int(cv2.contourArea(cnt))
+    if area == 0:
+        return None, 0, None
+    return "red", area, cv2.boundingRect(cnt)
 
 
 def detect_color(masks, min_area=MIN_AREA):
     """
-    Return 'red', 'green', or None — color of the largest contour across both
-    masks, gated by min_area.  This is what the ROS node publishes.
+    Return 'red' or None — 'red' iff the largest red contour clears
+    min_area.  This is what the ROS node publishes.
     """
     color, area, _ = find_largest_blob(masks)
     if area < min_area:
@@ -267,32 +251,30 @@ def _draw_yolo_detections(bgr, detections):
 # ── ROS2 node ────────────────────────────────────────────────────────────────
 class StoplightDetector(Node):
     """
-    Subscribes only to the cropped traffic-light frame from yolo_node.
+    Subscribes to the camera image and yolo_node's traffic_light ROI.
 
-    The crop is published by yolo_node as `/yolo/traffic_light/image` with
-    the same header.stamp as the source ZED frame YOLO ran on. Running
-    HSV directly on it removes the bbox-vs-image race that the previous
-    "subscribe to raw image + ROI separately" design suffered: the bbox
-    and the pixels we segment are guaranteed to come from the same frame.
+    yolo_node publishes `/yolo/traffic_light/roi` every frame (width=0,
+    height=0 when no light is detected).  This node caches the most
+    recent decoded frame from the camera topic and, on each non-empty
+    ROI, crops that frame and runs the HSV pass.  The bbox is from the
+    YOLO frame and the cached frame is at most a couple of frames newer,
+    so there's a small race — the safety_node's stoplight latch already
+    bridges that, and the watchdog covers prolonged silence.
 
     Detection lifecycle
     -------------------
-    Each cropped image arriving on `/yolo/traffic_light/image` triggers
-    one HSV pass. The result ("red", "green", or "none") is published on
-    `/stoplight/result` and the segmented preview on `/stoplight/segmented`.
+    Each non-empty `/yolo/traffic_light/roi` triggers one HSV pass on
+    the latest cached frame.  The result ("red" or "none") is published
+    on `/stoplight/result`.
 
     A watchdog timer publishes "none" on `/stoplight/result` whenever no
-    crop has arrived within `watchdog_sec` seconds (default 1.0s) — this
-    is how downstream learns "YOLO is not seeing a traffic light right
-    now", since yolo_node skips publishing the crop topic on frames where
-    the class is not detected. The safety_node's stoplight latch handles
-    the "we just saw red and YOLO briefly dropped" case; the watchdog
-    handles the "YOLO has been silent for a while".
+    non-empty ROI has arrived within `watchdog_sec` seconds (default
+    1.0s) — this is how downstream learns "YOLO is not seeing a traffic
+    light right now".
 
     Publications
     ------------
-    /stoplight/result      (std_msgs/String)    "red" | "green" | "none"
-    /stoplight/segmented   (sensor_msgs/Image)  debug — red+green pixels only
+    /stoplight/result      (std_msgs/String)    "red" | "none"
 
     HSV bounds and the min_area threshold are exposed as parameters so they
     can be tuned at launch time without editing the source.
@@ -301,9 +283,14 @@ class StoplightDetector(Node):
     def __init__(self):
         super().__init__("stoplight_detector")
 
-        self.crop_topic = (
-            self.declare_parameter("crop_topic",
-                                   "/yolo/traffic_light/image")
+        self.image_topic = (
+            self.declare_parameter("image_topic",
+                                   "/zed/zed_node/rgb/image_rect_color")
+            .get_parameter_value().string_value
+        )
+        self.roi_topic = (
+            self.declare_parameter("roi_topic",
+                                   "/yolo/traffic_light/roi")
             .get_parameter_value().string_value
         )
         self.watchdog_sec = (
@@ -318,10 +305,6 @@ class StoplightDetector(Node):
                 self._declare_hsv("red_low_2",  DEFAULT_RED_LOW_2),
                 self._declare_hsv("red_high_2", DEFAULT_RED_HIGH_2),
             ],
-            "green": [
-                self._declare_hsv("green_low",  DEFAULT_GREEN_LOW),
-                self._declare_hsv("green_high", DEFAULT_GREEN_HIGH),
-            ],
         }
         self.min_area = (
             self.declare_parameter("min_area", MIN_AREA)
@@ -329,18 +312,21 @@ class StoplightDetector(Node):
         )
 
         self.bridge = CvBridge()
-        self._last_crop_time = None  # rclpy.time.Time of last crop arrival
+        self._latest_frame = None       # most recent BGR frame from image_topic
+        self._last_detect_time = None   # rclpy.time.Time of last non-empty ROI
 
         self.create_subscription(
-            Image, self.crop_topic, self._crop_cb, qos_profile_sensor_data)
-        self.result_pub = self.create_publisher(String, "/stoplight/result",    10)
-        self.seg_pub    = self.create_publisher(Image,  "/stoplight/segmented", 10)
-        # 5 Hz watchdog — emits "none" if no crop arrived in watchdog_sec.
+            Image, self.image_topic, self._image_cb, qos_profile_sensor_data)
+        self.create_subscription(
+            RegionOfInterest, self.roi_topic, self._roi_cb, 10)
+        self.result_pub = self.create_publisher(String, "/stoplight/result", 10)
+        # 5 Hz watchdog — emits "none" if no detection arrived in watchdog_sec.
         self.create_timer(0.2, self._watchdog_cb)
 
         self.get_logger().info(
-            f"StoplightDetector ready — crop_topic={self.crop_topic}, "
-            f"watchdog={self.watchdog_sec}s, min_area={self.min_area}")
+            f"StoplightDetector ready — image_topic={self.image_topic}, "
+            f"roi_topic={self.roi_topic}, watchdog={self.watchdog_sec}s, "
+            f"min_area={self.min_area}")
 
     def _declare_hsv(self, name, default):
         val = list(
@@ -354,35 +340,45 @@ class StoplightDetector(Node):
             return list(default)
         return val
 
-    def _crop_cb(self, msg: Image):
+    def _image_cb(self, msg: Image):
         try:
-            crop = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            self._latest_frame = self.bridge.imgmsg_to_cv2(
+                msg, desired_encoding="bgr8")
         except Exception as e:
             self.get_logger().error(f"cv_bridge failed: {e}")
+
+    def _roi_cb(self, msg: RegionOfInterest):
+        if msg.width == 0 or msg.height == 0:
+            return
+        if self._latest_frame is None:
             return
 
+        h, w = self._latest_frame.shape[:2]
+        x1 = max(0, min(int(msg.x_offset), w - 1))
+        y1 = max(0, min(int(msg.y_offset), h - 1))
+        x2 = max(0, min(int(msg.x_offset) + int(msg.width),  w))
+        y2 = max(0, min(int(msg.y_offset) + int(msg.height), h))
+        if x2 <= x1 or y2 <= y1:
+            return
+
+        crop = self._latest_frame[y1:y2, x1:x2]
         if crop.size == 0:
             return
 
-        self._last_crop_time = self.get_clock().now()
+        self._last_detect_time = self.get_clock().now()
 
-        masks, composite = segment_lights(crop, self.ranges)
+        masks, _ = segment_lights(crop, self.ranges)
         result_msg = String()
         result_msg.data = detect_color(masks, self.min_area) or "none"
         self.result_pub.publish(result_msg)
 
-        seg_msg = self.bridge.cv2_to_imgmsg(composite, encoding="bgr8")
-        seg_msg.header = msg.header
-        self.seg_pub.publish(seg_msg)
-
     def _watchdog_cb(self):
-        """Publish "none" when the crop topic has been silent past the
-        watchdog window — covers the "YOLO sees no traffic light" case
-        since yolo_node only publishes the crop on detected frames."""
-        if self._last_crop_time is None:
+        """Publish "none" when no non-empty ROI has arrived within the
+        watchdog window — covers the "YOLO sees no traffic light" case."""
+        if self._last_detect_time is None:
             self.result_pub.publish(String(data="none"))
             return
-        elapsed = (self.get_clock().now() - self._last_crop_time).nanoseconds / 1e9
+        elapsed = (self.get_clock().now() - self._last_detect_time).nanoseconds / 1e9
         if elapsed > self.watchdog_sec:
             self.result_pub.publish(String(data="none"))
 
@@ -413,10 +409,9 @@ BUTTON_Y       = (TOOLBAR_HEIGHT - BUTTON_HEIGHT) // 2
 BUTTONS = [
     {"id": "red1",  "label": "Red 1",      "x": 10,  "w": 70},
     {"id": "red2",  "label": "Red 2",      "x": 85,  "w": 70},
-    {"id": "green", "label": "Green",      "x": 160, "w": 70},
-    {"id": "clear", "label": "Clear ROI",  "x": 245, "w": 100},
-    {"id": "print", "label": "Print Vals", "x": 350, "w": 100},
-    {"id": "quit",  "label": "Quit",       "x": 460, "w": 60},
+    {"id": "clear", "label": "Clear ROI",  "x": 170, "w": 100},
+    {"id": "print", "label": "Print Vals", "x": 275, "w": 100},
+    {"id": "quit",  "label": "Quit",       "x": 385, "w": 60},
 ]
 
 # Minimum contour area (px²) drawn as a candidate bbox on the filtered panel.
@@ -449,20 +444,18 @@ def _print_values(ranges, min_area):
     print(f"DEFAULT_RED_HIGH_1  = {ranges['red'][1]}")
     print(f"DEFAULT_RED_LOW_2   = {ranges['red'][2]}")
     print(f"DEFAULT_RED_HIGH_2  = {ranges['red'][3]}")
-    print(f"DEFAULT_GREEN_LOW   = {ranges['green'][0]}")
-    print(f"DEFAULT_GREEN_HIGH  = {ranges['green'][1]}")
     print(f"MIN_AREA            = {min_area}\n")
 
 
 def _auto_calibrate_from_click(state, img, x, y, half=AUTOCAL_PATCH_HALF):
     """
-    Update ONLY the active filter's HSV interval based on a patch around
-    (x, y).  No auto-detection, no auto-switching.
+    Update ONLY the active red sub-range's HSV interval based on a patch
+    around (x, y).  No auto-detection, no auto-switching.
 
-    For red sub-ranges, the patch's hues are restricted to the relevant side
-    of the seam (sub-1 → H<90, sub-2 → H>=90) so a click that straddles the
-    seam can't blow the band up.  If no relevant pixels exist in the patch,
-    nothing changes and a hint is printed.
+    The patch's hues are restricted to the relevant side of the seam
+    (sub-1 → H<90, sub-2 → H>=90) so a click that straddles the seam can't
+    blow the band up.  If no relevant pixels exist in the patch, nothing
+    changes and a hint is printed.
     """
     h, w = img.shape[:2]
     x0 = max(0, x - half); x1 = min(w, x + half + 1)
@@ -482,14 +475,10 @@ def _auto_calibrate_from_click(state, img, x, y, half=AUTOCAL_PATCH_HALF):
         H = H_all[H_all < 90]
         clamp_lo, clamp_hi = 0, 89
         color_key, slot_lo, slot_hi = "red", 0, 1
-    elif active == "red2":
+    else:  # red2
         H = H_all[H_all >= 90]
         clamp_lo, clamp_hi = 90, 179
         color_key, slot_lo, slot_hi = "red", 2, 3
-    else:  # green
-        H = H_all
-        clamp_lo, clamp_hi = 0, 179
-        color_key, slot_lo, slot_hi = "green", 0, 1
 
     if len(H) == 0:
         other = "Red 2" if active == "red1" else "Red 1"
@@ -539,7 +528,7 @@ def _find_button(x, y):
 
 
 def calibrate(paths):
-    """Mouse-driven HSV calibration GUI for red + green stoplight detection."""
+    """Mouse-driven HSV calibration GUI for red stoplight detection."""
     images = [(p, cv2.imread(p)) for p in paths]
     images = [(p, img) for p, img in images if img is not None]
     if not images:
@@ -610,9 +599,7 @@ def calibrate(paths):
     def active_indices():
         if state["active"] == "red1":
             return "red", 0, 1
-        if state["active"] == "red2":
-            return "red", 2, 3
-        return "green", 0, 1
+        return "red", 2, 3
 
     def push_to_trackbars():
         color, lo_i, hi_i = active_indices()
@@ -640,7 +627,7 @@ def calibrate(paths):
         state["min_area"] = cv2.getTrackbarPos("Min_Area", win)
 
     def handle_button(btn_id):
-        if btn_id in ("red1", "red2", "green"):
+        if btn_id in ("red1", "red2"):
             state["active"] = btn_id
             push_to_trackbars()
         elif btn_id == "clear":
@@ -706,12 +693,9 @@ def calibrate(paths):
         if state["active"] == "red1":
             active_low  = state["ranges"]["red"][0]
             active_high = state["ranges"]["red"][1]
-        elif state["active"] == "red2":
+        else:
             active_low  = state["ranges"]["red"][2]
             active_high = state["ranges"]["red"][3]
-        else:
-            active_low  = state["ranges"]["green"][0]
-            active_high = state["ranges"]["green"][1]
 
         # Build the active filter's mask + filtered display, optionally inside
         # the ROI.  Right panel = active filter only, so what the trackbars
@@ -754,10 +738,8 @@ def calibrate(paths):
                            if area >= state["min_area"])
         passes = largest_area >= state["min_area"]
 
-        active_color_bgr = (
-            (0, 0, 255) if state["active"].startswith("red") else (0, 200, 0)
-        )
-        active_color_name = "red" if state["active"].startswith("red") else "green"
+        active_color_bgr = (0, 0, 255)
+        active_color_name = "red"
 
         # ── Annotate RIGHT panel (filtered): every candidate gets a bbox.
         # Thick = above threshold, thin = below.  Largest gets its area
@@ -801,8 +783,7 @@ def calibrate(paths):
                           (200, 200, 200), 1)
 
         active_label = {"red1": "red sub-1",
-                        "red2": "red sub-2",
-                        "green": "green"}[state["active"]]
+                        "red2": "red sub-2"}[state["active"]]
         cv2.putText(left, f"editing: {active_label}",
                     (10, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)

@@ -50,7 +50,8 @@
   <node pkg="final_challenge" exec="sign_detector" output="screen"/>
 
 
-  <!-- ── Traffic-light detector (HSV on /yolo/traffic_light/image). ── -->
+  <!-- ── Traffic-light detector (HSV on the camera frame, gated by
+       /yolo/traffic_light/roi). ── -->
   <node pkg="final_challenge" exec="stoplight_detection" output="screen">
   </node>
 

@@ -108,16 +108,31 @@ class ParkingController(Node):
         True  → activate; reset per-run state so a second attempt is clean.
         False → deactivate; stop driving immediately.
         """
+        self.get_logger().info(
+            f"[DEBUG] /parking/trigger received: data={msg.data}, "
+            f"current active={self.active}, done={self.done}"
+        )
         if msg.data and not self.active:
-            self.get_logger().info("Parking controller ACTIVATED.")
+            self.get_logger().info("[DEBUG] Parking controller ACTIVATED.")
             self.active             = True
             self.done               = False
             self.prev_angle_to_cone = None
             self.prev_time_sec      = None
+            self.get_logger().info(
+                f"[DEBUG] State reset: active={self.active}, done={self.done}, "
+                f"target_distance={self.parking_distance} m, "
+                f"last_relative=({self.relative_x:.3f}, {self.relative_y:.3f})"
+            )
         elif not msg.data and self.active:
-            self.get_logger().info("Parking controller DEACTIVATED.")
+            self.get_logger().info("[DEBUG] Parking controller DEACTIVATED.")
             self.active = False
             self._publish_stop()
+            self.get_logger().info("[DEBUG] Stop command published on deactivation.")
+        else:
+            self.get_logger().info(
+                f"[DEBUG] Trigger ignored — already in requested state "
+                f"(msg.data={msg.data}, active={self.active})."
+            )
 
     # ======================================================================
     #  Main control callback
@@ -133,7 +148,17 @@ class ParkingController(Node):
         self.relative_x = msg.x_pos
         self.relative_y = msg.y_pos
 
+        self.get_logger().info(
+            f"[DEBUG] /relative_cone received: x={msg.x_pos:.3f} y={msg.y_pos:.3f} "
+            f"active={self.active} done={self.done}",
+            throttle_duration_sec=0.5,
+        )
+
         if not self.active:
+            self.get_logger().info(
+                "[DEBUG] Inactive — skipping control loop, not publishing drive.",
+                throttle_duration_sec=2.0,
+            )
             return
 
         drive_cmd = AckermannDriveStamped()
@@ -143,10 +168,18 @@ class ParkingController(Node):
         distance_to_cone = np.hypot(self.relative_x, self.relative_y)
         distance_error   = distance_to_cone - self.parking_distance
 
+        self.get_logger().info(
+            f"[DEBUG] Geometry: dist={distance_to_cone:.3f} m, "
+            f"angle={np.degrees(angle_to_cone):.2f} deg, "
+            f"dist_error={distance_error:+.3f} m (target={self.parking_distance} m)",
+            throttle_duration_sec=0.25,
+        )
+
         # ── PD steering — derivative of angle error damps oscillation ─────
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         if self.prev_time_sec is None or self.prev_angle_to_cone is None:
             derror = 0.0
+            self.get_logger().info("[DEBUG] First control tick — derror forced to 0.")
         else:
             dt     = max(now_sec - self.prev_time_sec, 1e-3)
             derror = (angle_to_cone - self.prev_angle_to_cone) / dt
@@ -155,6 +188,13 @@ class ParkingController(Node):
         k_d_steer = 0.1
         steering_cmd   = k_p_steer * angle_to_cone - k_d_steer * derror
         steering_angle = float(np.clip(steering_cmd, -0.34, 0.34))
+
+        if abs(steering_cmd) > 0.34:
+            self.get_logger().info(
+                f"[DEBUG] Steering saturated: raw={steering_cmd:+.3f} → "
+                f"clipped={steering_angle:+.3f}",
+                throttle_duration_sec=0.5,
+            )
 
         self.prev_angle_to_cone = angle_to_cone
         self.prev_time_sec      = now_sec
@@ -170,27 +210,50 @@ class ParkingController(Node):
             drive_cmd.drive.speed          = 0.0
             drive_cmd.drive.steering_angle = 0.0
 
+            self.get_logger().info(
+                f"[DEBUG] DECISION=STOP — within jitter deadband "
+                f"(|dist_err|={abs(distance_error):.3f} < {jitter_distance}, "
+                f"|angle|={angle_error:.3f} < {jitter_angle})"
+            )
+
             # Publish /parking/done once per activation
             if not self.done:
                 self.get_logger().info(
-                    f"Parked at {distance_to_cone:.2f} m — signalling done."
+                    f"[DEBUG] Parked at {distance_to_cone:.2f} m — "
+                    f"publishing /parking/done=True."
                 )
                 self.done   = True
                 self.active = False
                 done_msg      = Bool()
                 done_msg.data = True
                 self.done_pub.publish(done_msg)
+                self.get_logger().info("[DEBUG] /parking/done published, controller now inactive.")
+            else:
+                self.get_logger().info(
+                    "[DEBUG] Already done — not republishing /parking/done.",
+                    throttle_duration_sec=1.0,
+                )
 
         elif distance_error > 0:
             # Too far — drive forward, proportional speed
             speed = float(np.clip(0.5 * distance_error, 0.2, 1.0))
             drive_cmd.drive.speed          = speed
             drive_cmd.drive.steering_angle = steering_angle
+            self.get_logger().info(
+                f"[DEBUG] DECISION=FORWARD — speed={speed:.3f} steer={steering_angle:+.3f} "
+                f"(dist_err=+{distance_error:.3f})",
+                throttle_duration_sec=0.25,
+            )
         else:
             # Overshot — reverse slowly
             speed = float(np.clip(0.5 * distance_error, -1.0, -0.2))
             drive_cmd.drive.speed          = speed
             drive_cmd.drive.steering_angle = -steering_angle
+            self.get_logger().info(
+                f"[DEBUG] DECISION=REVERSE — speed={speed:.3f} steer={-steering_angle:+.3f} "
+                f"(overshot, dist_err={distance_error:.3f})",
+                throttle_duration_sec=0.25,
+            )
 
         # ── Log + publish ─────────────────────────────────────────────────
         self._csv_writer.writerow([
@@ -202,6 +265,11 @@ class ParkingController(Node):
         self._csv_file.flush()
 
         self.drive_pub.publish(drive_cmd)
+        self.get_logger().info(
+            f"[DEBUG] Drive published: speed={drive_cmd.drive.speed:+.3f} "
+            f"steer={drive_cmd.drive.steering_angle:+.3f}",
+            throttle_duration_sec=0.25,
+        )
         self._publish_error()
 
     # ======================================================================
@@ -224,6 +292,7 @@ class ParkingController(Node):
         msg.drive.speed          = 0.0
         msg.drive.steering_angle = 0.0
         self.drive_pub.publish(msg)
+        self.get_logger().info("[DEBUG] _publish_stop() — zero-velocity drive sent.")
 
 
 def main(args=None):

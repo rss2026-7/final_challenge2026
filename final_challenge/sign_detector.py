@@ -20,9 +20,8 @@ Behaviors
    class name on `/sign_detection/result`, and save the most recent
    `/yolo/annotated_image` to disk under `save_dir`.
 
-3. Live debug feed: while triggered, the latest `/yolo/annotated_image`
-   is rebroadcast on `/sign_detection/live_feed` so existing RViz/foxglove
-   layouts keep working.
+For a live debug feed, subscribe directly to `/yolo/annotated_image` —
+this node no longer republishes it.
 
 The trigger Bool gates ALL publishing; toggling it back to False also
 re-arms the one-shot for the next leg.
@@ -116,10 +115,6 @@ class SignDetectorNode(Node):
         )
 
         self.result_pub = self.create_publisher(String, "/sign_detection/result", 10)
-        self.annotated_pub = self.create_publisher(
-            Image, "/sign_detection/annotated_image", 10)
-        self.live_feed_pub = self.create_publisher(
-            Image, "/sign_detection/live_feed", qos_profile_sensor_data)
         self.cone_px_pub = self.create_publisher(
             ConeLocationPixel, "/relative_cone_px", 10)
 
@@ -139,8 +134,6 @@ class SignDetectorNode(Node):
 
     def _annotated_cb(self, msg: Image) -> None:
         self._latest_annotated = msg
-        if self.active:
-            self.live_feed_pub.publish(msg)
 
     def _roi_cb(self, msg: RegionOfInterest, class_name: str) -> None:
         # yolo_node publishes width=0/height=0 every frame the class is
@@ -214,7 +207,6 @@ class SignDetectorNode(Node):
         cv2.imwrite(save_path, annotated_bgr)
 
         self.result_pub.publish(String(data=best_name))
-        self.annotated_pub.publish(self._latest_annotated)
         self.result_published = True
 
         self.get_logger().info(
