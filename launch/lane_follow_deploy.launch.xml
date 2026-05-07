@@ -2,9 +2,11 @@
   <!-- Real-robot lane following.
 
        The lane_tracer pure-pursuit defaults live inside lane_follower.py
-       (W=0.33 m, D=3.5/4.0/3.0 m tangent/default/corner, v=2.5 m/s).
-       Only the environment-specific drive topic is overridden here;
-       everything else can be set on the CLI when needed.
+       (W=0.33 m, D=3.5/4.0/6.0 m tangent/default/corner, v=4.1 m/s).
+       The detector's aim-point distance LOOKAHEAD_GROUND_X_M=1.0 m lives
+       in lane_detector.py. Only the environment-specific drive topic and
+       a couple of high-level toggles are overridden here; everything else
+       can be set on the CLI when needed.
 
        Examples:
          ros2 launch final_challenge lane_follow_deploy.launch.xml
@@ -12,10 +14,15 @@
               cruise_speed_mps:=2.0 idle_when_blind:=false
   -->
 
-  <arg name="cruise_speed_mps" default="2.5"
+  <arg name="cruise_speed_mps" default="4.1"
        description="Forward speed (m/s)."/>
-  <arg name="drive_topic" default="/vesc/low_level/input/navigation"
-       description="AckermannDriveStamped sink consumed by the VESC."/>
+  <arg name="drive_topic" default="/vesc/high_level/input/nav_0"
+       description="AckermannDriveStamped sink. Use the high-level nav_0
+                    topic so the safety_controller (subscribed there) can
+                    interpose stops / speed limits and publish the final
+                    cmd on /vesc/low_level/input/safety. Override to
+                    /vesc/low_level/input/navigation only to deliberately
+                    bypass safety."/>
   <arg name="idle_when_blind" default="true"
        description="Stop the wheels (v=0) when no fresh boundary path is
                     available — also at startup before the first detection."/>

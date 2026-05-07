@@ -53,7 +53,12 @@ class ParkingController(Node):
         super().__init__("parking_controller")
 
         # ── Parameters ────────────────────────────────────────────────────
-        self.declare_parameter("drive_topic",      "/vesc/low_level/input/navigation")
+        # Publish to the high-level nav input so the safety_controller
+        # (subscribed there) can interpose stops / speed limits before the
+        # cmd hits the VESC. /vesc/low_level/input/navigation bypasses
+        # safety entirely — only use it when explicitly testing without
+        # the safety stack.
+        self.declare_parameter("drive_topic",      "/vesc/high_level/input/nav_0")
         self.declare_parameter("parking_distance", 0.75)  # metres — target stop distance
 
         drive_topic = self.get_parameter("drive_topic").value

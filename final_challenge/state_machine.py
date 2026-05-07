@@ -11,10 +11,15 @@ Placeholders for teammates are clearly marked:
   # [WEIMING] — object detection (YOLO): parking meter, traffic light
   # [KEVIN]   — parking controller: precise stop within 1 m for 5 s
 
-Safety controller (Diego) is FULLY EXTERNAL — his node publishes zero-velocity
-drive commands directly to the drive topic at VESC level. The state machine
-never enters a STOPPED state for traffic laws; the car pauses and resumes
-naturally without any state machine involvement.
+Safety controller (Diego) is FULLY EXTERNAL — it subscribes to
+/vesc/high_level/input/nav_0 to learn nav intent and publishes its
+own commands on /vesc/low_level/input/safety, which has higher mux
+priority and therefore overrides nav. The state machine never enters
+a STOPPED state for traffic laws; the car pauses and resumes naturally
+without any state machine involvement. For this to work, every node
+that emits drive commands (including this one) must publish to
+/vesc/high_level/input/nav_0 — NOT directly to /vesc/ackermann_cmd
+or /vesc/low_level/input/navigation, both of which bypass safety.
 
 Goal locations are provided by basement_point_publisher.py (our testing node)
 which listens for two RViz "Publish Point" clicks and publishes them as a
@@ -69,7 +74,11 @@ class FinalChallengeStateMachine(Node):
         #  Parameters                                                          #
         # ------------------------------------------------------------------ #
         self.declare_parameter("odom_topic",             "/pf/pose/odom")
-        self.declare_parameter("drive_topic",            "/vesc/ackermann_cmd")
+        # /vesc/high_level/input/nav_0 is the safety_controller's nav input;
+        # publishing here lets it interpose on this node's _stop() and
+        # recovery-reverse commands. /vesc/ackermann_cmd is the mux's final
+        # output and bypasses every layer above the VESC — never default to it.
+        self.declare_parameter("drive_topic",            "/vesc/high_level/input/nav_0")
         self.declare_parameter("arrival_threshold",      0.75)  # metres
         self.declare_parameter("park_duration",          5.0)   # seconds
         self.declare_parameter("return_to_start",        True)

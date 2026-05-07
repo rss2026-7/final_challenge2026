@@ -76,7 +76,7 @@ CLUSTER_ANG_DEG = 10.0
 GROUND_ANGLE_FLOOR_DEG = -15.0
 GROUND_ANGLE_CEIL_DEG  =  60.0
 
-LOOKAHEAD_GROUND_X_M   = 0.6   # ground-frame forward distance for the midpoint
+LOOKAHEAD_GROUND_X_M   = 1.0   # ground-frame forward distance for the midpoint
 
 
 # ───────────────────────────── geometry helpers ──────────────────────────
