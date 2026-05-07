@@ -53,9 +53,19 @@
        Keep these two values mirrored to commit cff690f for the `if`
        branch; only edit the `unless` branch values during normal tuning. -->
   <let name="cruise_speed_mps_default"     value="2.5" if="$(var slow)"/>
-  <let name="cruise_speed_mps_default"     value="4.1" unless="$(var slow)"/>
+  <let name="cruise_speed_mps_default"     value="3.5" unless="$(var slow)"/>
   <let name="lookahead_ground_x_m_default" value="0.6" if="$(var slow)"/>
-  <let name="lookahead_ground_x_m_default" value="1.0" unless="$(var slow)"/>
+  <let name="lookahead_ground_x_m_default" value="0.7" unless="$(var slow)"/>
+
+  <!-- Pure-pursuit lookahead radii D (m) used by lane_follower.py inside
+       δ = atan2(2 W sinη, D). The corner schedule in `_select_lookahead`
+       picks tangent (|η| ≤ eta_corner_deadband_rad) or corner (|η| above
+       it). Slow branch mirrors cff690f (3.5 / 6.0). -->
+  <let name="pursuit_radius_tangent_m_default" value="3.5" if="$(var slow)"/>
+  <let name="pursuit_radius_corner_m_default"  value="6.0" if="$(var slow)"/>
+
+  <let name="pursuit_radius_tangent_m_default" value="3.0" unless="$(var slow)"/>
+  <let name="pursuit_radius_corner_m_default"  value="3.0" unless="$(var slow)"/>
 
   <!-- ── user-overridable args ───────────────────────────────────────
        Each of these takes its default from the slow-driven `<let>`
@@ -69,13 +79,20 @@
        description="Forward distance (m, car frame) at which the
                     lane_detector samples the midpoint between the two
                     boundary lines. Overrides the per-`slow` default."/>
-  <arg name="drive_topic" default="/vesc/high_level/input/nav_0"
-       description="AckermannDriveStamped sink. Use the high-level nav_0
-                    topic so the safety_controller (subscribed there) can
-                    interpose stops / speed limits and publish the final
-                    cmd on /vesc/low_level/input/safety. Override to
-                    /vesc/low_level/input/navigation only to deliberately
-                    bypass safety."/>
+  <arg name="pursuit_radius_tangent_m" default="$(var pursuit_radius_tangent_m_default)"
+       description="Pure-pursuit lookahead radius D used on near-tangent
+                    sections (|η| inside the corner deadband). Smaller D
+                    = stronger steer; larger D = softer/smoother."/>
+  <arg name="pursuit_radius_corner_m" default="$(var pursuit_radius_corner_m_default)"
+       description="Pure-pursuit lookahead radius D used when the
+                    bearing |η| exceeds eta_corner_deadband_rad."/>
+  <arg name="drive_topic" default="/vesc/low_level/input/navigation"
+       description="AckermannDriveStamped sink. Default bypasses the
+                    safety_controller (publishes directly on
+                    /vesc/low_level/input/navigation) so the silent
+                    speed-cap caution cone can't throttle 3.5 m/s runs.
+                    Override to /vesc/high_level/input/nav_0 to route
+                    through safety again."/>
   <arg name="idle_when_blind" default="true"
        description="Stop the wheels (v=0) when no fresh boundary path is
                     available — also at startup before the first detection."/>
@@ -95,9 +112,11 @@
   <!-- ── pure-pursuit lane follower ──────────────────────────────────
        Receives the cruise speed and the idle-when-blind toggle. -->
   <node pkg="final_challenge" exec="boundary_pure_pursuit" output="screen">
-    <param name="drive_topic"      value="$(var drive_topic)"/>
-    <param name="cruise_speed_mps" value="$(var cruise_speed_mps)"/>
-    <param name="idle_when_blind"  value="$(var idle_when_blind)"/>
+    <param name="drive_topic"               value="$(var drive_topic)"/>
+    <param name="cruise_speed_mps"          value="$(var cruise_speed_mps)"/>
+    <param name="idle_when_blind"           value="$(var idle_when_blind)"/>
+    <param name="pursuit_radius_tangent_m"  value="$(var pursuit_radius_tangent_m)"/>
+    <param name="pursuit_radius_corner_m"   value="$(var pursuit_radius_corner_m)"/>
   </node>
 
 </launch>

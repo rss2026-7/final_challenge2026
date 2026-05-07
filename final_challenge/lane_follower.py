@@ -66,7 +66,6 @@ class LaneTracer(Node):
 
         # ── geometry & pursuit gains (mirrors the racetrack reference) ──
         self.declare_parameter("wheelbase_m", 0.33)
-        self.declare_parameter("pursuit_radius_default_m", 4.0)
         self.declare_parameter("pursuit_radius_corner_m",  6.0)
         self.declare_parameter("pursuit_radius_tangent_m", 3.5)
         self.declare_parameter("eta_corner_deadband_rad",  0.2)
@@ -118,8 +117,7 @@ class LaneTracer(Node):
 
         self.get_logger().info(
             f"LaneTracer up — W={self.wheelbase_m:.2f} m, "
-            f"D={self.pursuit_radius_tangent_m:.1f}/{self.pursuit_radius_default_m:.1f}/"
-            f"{self.pursuit_radius_corner_m:.1f} m (tan/def/cor), "
+            f"D={self.pursuit_radius_tangent_m:.1f}/{self.pursuit_radius_corner_m:.1f} m (tan/cor), "
             f"v={self.cruise_speed_mps:.1f} m/s"
         )
 
@@ -127,7 +125,6 @@ class LaneTracer(Node):
     def _refresh_tunables(self) -> None:
         g = self.get_parameter
         self.wheelbase_m = float(g("wheelbase_m").value)
-        self.pursuit_radius_default_m = float(g("pursuit_radius_default_m").value)
         self.pursuit_radius_corner_m  = float(g("pursuit_radius_corner_m").value)
         self.pursuit_radius_tangent_m = float(g("pursuit_radius_tangent_m").value)
         self.eta_corner_deadband_rad  = float(g("eta_corner_deadband_rad").value)
@@ -140,7 +137,7 @@ class LaneTracer(Node):
 
     def _on_param_update(self, params) -> SetParametersResult:
         floats = {
-            "wheelbase_m", "pursuit_radius_default_m", "pursuit_radius_corner_m",
+            "wheelbase_m", "pursuit_radius_corner_m",
             "pursuit_radius_tangent_m", "eta_corner_deadband_rad",
             "camera_lateral_offset_m", "cruise_speed_mps",
             "max_steering_rad", "freshness_window_s", "tick_rate_hz",
