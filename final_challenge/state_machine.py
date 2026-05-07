@@ -342,9 +342,8 @@ class FinalChallengeStateMachine(Node):
         Reached the goal zone. Reset detection state and trigger YOLO.
         """
         self.detected_sign = None
-        trigger = Bool()
-        trigger.data = True
-        self.trigger_detection_pub.publish(trigger)
+        self.trigger_detection_pub.publish(Bool(data=False))
+        self.trigger_detection_pub.publish(Bool(data=True))
         self.get_logger().info(
             f"Arrived at location {self.current_goal_idx + 1}. Triggering sign detection."
         )

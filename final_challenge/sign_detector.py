@@ -126,10 +126,10 @@ class SignDetectorNode(Node):
     def _trigger_cb(self, msg: Bool) -> None:
         if msg.data:
             self.active = True
+            self.result_published = False
             self.get_logger().info("Detection triggered.")
         else:
             self.active = False
-            # Re-arm the one-shot for the next leg.
             self.result_published = False
 
     def _annotated_cb(self, msg: Image) -> None:
