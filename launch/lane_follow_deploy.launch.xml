@@ -1,21 +1,74 @@
 <launch>
-  <!-- Real-robot lane following.
+  <!-- ═══════════════════════════════════════════════════════════════════
+       Real-robot lane following.
 
        The lane_tracer pure-pursuit defaults live inside lane_follower.py
        (W=0.33 m, D=3.5/4.0/6.0 m tangent/default/corner, v=4.1 m/s).
-       The detector's aim-point distance LOOKAHEAD_GROUND_X_M=1.0 m lives
-       in lane_detector.py. Only the environment-specific drive topic and
-       a couple of high-level toggles are overridden here; everything else
-       can be set on the CLI when needed.
+       The detector's aim-point distance is exposed as a ROS parameter
+       (`lookahead_ground_x_m`) and overridden from this launch file so
+       the same launch invocation owns both the speed and the lookahead.
 
-       Examples:
-         ros2 launch final_challenge lane_follow_deploy.launch.xml
-         ros2 launch final_challenge lane_follow_deploy.launch.xml \
-              cruise_speed_mps:=2.0 idle_when_blind:=false
-  -->
+       ── slow:=true|false ─────────────────────────────────────────────
+       The `slow` arg toggles between two known-good operating points:
 
-  <arg name="cruise_speed_mps" default="4.1"
-       description="Forward speed (m/s)."/>
+         slow:=false  (default — active tuning path)
+                      cruise_speed_mps      = 4.1
+                      lookahead_ground_x_m  = 1.0
+                      → current fast configuration; this is what we
+                        iterate on going forward.
+
+         slow:=true   (frozen reference: commit cff690f "it works")
+                      cruise_speed_mps      = 2.5
+                      lookahead_ground_x_m  = 0.6
+                      → preserves the lane stack as it ran at the
+                        commit known to drive correctly. Use this when
+                        the fast path regresses and we need a fall-back.
+
+       Anything explicitly passed on the CLI (e.g. `cruise_speed_mps:=3.0`)
+       still wins over the slow toggle, because slow only feeds the
+       *default* of each downstream arg.
+  ══════════════════════════════════════════════════════════════════ -->
+
+  <!-- ── slow toggle ──────────────────────────────────────────────────
+       Boolean. False = fast / current-tuning path. True = frozen
+       cff690f configuration (cruise=2.5 m/s, lookahead=0.6 m).
+       Tuning changes from this point forward apply to the slow:=false
+       branch only; the slow:=true values must keep matching cff690f. -->
+  <arg name="slow" default="false"
+       description="When true, restore the cff690f known-working lane
+                    stack (cruise=2.5 m/s, lookahead=0.6 m). Default
+                    false = the active fast tuning path (cruise=4.1 m/s,
+                    lookahead=1.0 m)."/>
+
+  <!-- ── slow-driven defaults ─────────────────────────────────────────
+       These `<let>` bindings compute the per-knob default that downstream
+       `<arg>` declarations will fall back to. We intentionally split
+       cruise_speed_mps and lookahead_ground_x_m into two separate
+       `<let>`s each (one with `if`, one with `unless`) because ROS 2
+       launch XML evaluates both branches' attribute substitutions but
+       only commits the one whose condition is true — which lets us
+       cleanly express "if slow, use the cff690f number; otherwise use
+       the current fast number" without a $(eval ...) one-liner.
+
+       Keep these two values mirrored to commit cff690f for the `if`
+       branch; only edit the `unless` branch values during normal tuning. -->
+  <let name="cruise_speed_mps_default"     value="2.5" if="$(var slow)"/>
+  <let name="cruise_speed_mps_default"     value="4.1" unless="$(var slow)"/>
+  <let name="lookahead_ground_x_m_default" value="0.6" if="$(var slow)"/>
+  <let name="lookahead_ground_x_m_default" value="1.0" unless="$(var slow)"/>
+
+  <!-- ── user-overridable args ───────────────────────────────────────
+       Each of these takes its default from the slow-driven `<let>`
+       above, but a CLI override (e.g. `cruise_speed_mps:=3.0`) still
+       takes precedence — the slow toggle only changes what happens
+       when nothing is overridden. -->
+  <arg name="cruise_speed_mps" default="$(var cruise_speed_mps_default)"
+       description="Forward speed (m/s) commanded by the pure-pursuit
+                    follower. Overrides the per-`slow` default above."/>
+  <arg name="lookahead_ground_x_m" default="$(var lookahead_ground_x_m_default)"
+       description="Forward distance (m, car frame) at which the
+                    lane_detector samples the midpoint between the two
+                    boundary lines. Overrides the per-`slow` default."/>
   <arg name="drive_topic" default="/vesc/high_level/input/nav_0"
        description="AckermannDriveStamped sink. Use the high-level nav_0
                     topic so the safety_controller (subscribed there) can
@@ -27,12 +80,20 @@
        description="Stop the wheels (v=0) when no fresh boundary path is
                     available — also at startup before the first detection."/>
 
+  <!-- ── camera ───────────────────────────────────────────────────── -->
   <include file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py">
     <arg name="camera_model" value="zed"/>
   </include>
 
-  <node pkg="final_challenge" exec="lane_detector" output="screen"/>
+  <!-- ── lane detector ───────────────────────────────────────────────
+       Receives the lookahead-distance override so the slow toggle
+       reaches the perception side, not just the speed knob. -->
+  <node pkg="final_challenge" exec="lane_detector" output="screen">
+    <param name="lookahead_ground_x_m" value="$(var lookahead_ground_x_m)"/>
+  </node>
 
+  <!-- ── pure-pursuit lane follower ──────────────────────────────────
+       Receives the cruise speed and the idle-when-blind toggle. -->
   <node pkg="final_challenge" exec="boundary_pure_pursuit" output="screen">
     <param name="drive_topic"      value="$(var drive_topic)"/>
     <param name="cruise_speed_mps" value="$(var cruise_speed_mps)"/>

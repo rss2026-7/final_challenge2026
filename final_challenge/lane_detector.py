@@ -19,11 +19,16 @@ Pipeline (single image callback):
         ▼  Reject implausible angles
         │  Pick innermost left + innermost right boundary
         ▼
-    Intersect each ground-frame boundary with x = LOOKAHEAD_GROUND_X_M
+    Intersect each ground-frame boundary with x = lookahead_ground_x_m
         │
         ▼  Average the two intersection y's → ground midpoint
         ▼
-    Publish (LOOKAHEAD_GROUND_X_M, y_mid) as Point32 on /lookahead_point
+    Publish (lookahead_ground_x_m, y_mid) as Point32 on /lookahead_point
+
+The `lookahead_ground_x_m` ROS parameter is owned by the launch file's
+`slow` arg (see launch/lane_follow_deploy.launch.xml): 1.0 m on the
+fast / non-slow tuning path, 0.6 m on the frozen slow path that mirrors
+commit cff690f's known-working configuration.
 
 Topics
 ------
@@ -76,7 +81,18 @@ CLUSTER_ANG_DEG = 10.0
 GROUND_ANGLE_FLOOR_DEG = -15.0
 GROUND_ANGLE_CEIL_DEG  =  60.0
 
-LOOKAHEAD_GROUND_X_M   = 1.0   # ground-frame forward distance for the midpoint
+# ── lookahead aim-point distance ─────────────────────────────────────────
+# Forward distance (metres, car frame) at which we sample the midpoint
+# between the left and right ground-frame boundary lines. Exposed as a
+# ROS parameter (`lookahead_ground_x_m`) so the launch file can flip it
+# between the two known-good operating points without code edits:
+#   • non-slow / fast path (default, current tuning):   1.0 m
+#   • slow path           (frozen cff690f reference):   0.6 m
+# Larger values look further ahead → smoother but laggier steering;
+# smaller values are more reactive but noisier. The default below is the
+# value the node uses when no parameter is supplied (e.g. when launched
+# standalone outside lane_follow_deploy.launch.xml).
+LOOKAHEAD_GROUND_X_M_DEFAULT = 1.0
 
 
 # ───────────────────────────── geometry helpers ──────────────────────────
@@ -224,9 +240,22 @@ class WhiteLineHunter(Node):
         self.declare_parameter("lookahead_topic",  "/lookahead_point")
         self.declare_parameter("debug_image_topic", "/lane_debug_img")
 
+        # Forward aim-point distance (m). Owned by the launch file's `slow`
+        # toggle: 1.0 m on the non-slow / fast path, 0.6 m on the frozen
+        # slow path that mirrors commit cff690f. See LOOKAHEAD_GROUND_X_M_DEFAULT
+        # above for the rationale on each value.
+        self.declare_parameter("lookahead_ground_x_m",
+                               LOOKAHEAD_GROUND_X_M_DEFAULT)
+
         cam_topic   = str(self.get_parameter("camera_topic").value)
         look_topic  = str(self.get_parameter("lookahead_topic").value)
         debug_topic = str(self.get_parameter("debug_image_topic").value)
+        # Cached at startup — the parameter is treated as static; flipping
+        # `slow` requires relaunching the stack, which is intentional since
+        # the slow path is a fall-back configuration, not a runtime mode.
+        self._lookahead_ground_x_m = float(
+            self.get_parameter("lookahead_ground_x_m").value
+        )
 
         latest_only = QoSProfile(
             depth=1,
@@ -325,7 +354,7 @@ class WhiteLineHunter(Node):
     def _derive_lookahead(self, left_pix, right_pix
                           ) -> Tuple[float, float, Optional[Tuple[float, float]]]:
         """Compute (x_car, y_car, uv) of the lookahead as the ground-frame
-        midpoint of the two boundaries at x = LOOKAHEAD_GROUND_X_M.
+        midpoint of the two boundaries at x = self._lookahead_ground_x_m.
 
         Each boundary segment is projected to the ground plane, then we
         intersect each ground line with x = L_x and average the two y's.
@@ -335,7 +364,10 @@ class WhiteLineHunter(Node):
         if left_pix is None or right_pix is None:
             return 0.0, 0.0, None
 
-        L_x = LOOKAHEAD_GROUND_X_M
+        # Pull from the cached parameter (set by the launch file's `slow`
+        # arg) instead of a module constant, so swapping operating points
+        # is purely a launch-file concern.
+        L_x = self._lookahead_ground_x_m
 
         def _y_at_Lx(seg):
             x1, y1, x2, y2 = seg
