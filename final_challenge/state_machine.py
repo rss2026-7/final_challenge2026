@@ -29,6 +29,23 @@ Run alongside:
   ros2 launch path_planning_pkg real.launch.xml      (Lab 6 planner + follower)
   ros2 run final_challenge basement_point_publisher  (click 2 goals in RViz)
   ros2 run final_challenge state_machine
+
+─── HEADHUNTER ───────────────────────────────────────────────────────────────
+Problem: if the TA sets a goal point on top of or past the sign, the path
+planner drives the car right there — safety controller fires before parking
+controller ever gets a chance, and we stall in NAVIGATING forever.
+
+Fix: while navigating and within HEADHUNTER_RADIUS metres of the goal, poll
+YOLO's /yolo/parking_meter/roi. If the sign is visible for
+HEADHUNTER_DEBOUNCE_TICKS consecutive state-machine ticks, immediately kill
+path planning and jump straight to PARKING — skipping ARRIVED and
+DETECTING_SIGN entirely.
+
+Killing path planning means publishing a zero-pose PoseArray to
+/trajectory/current so the trajectory_follower silences itself (len(pts) < 2
+in pose_callback → returns without publishing). Both the HEADHUNTER and the
+normal ARRIVED transition do this.
+──────────────────────────────────────────────────────────────────────────────
 """
 
 import math
@@ -41,7 +58,24 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import PoseArray, PoseStamped
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import RegionOfInterest
 from std_msgs.msg import Bool, String
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HEADHUNTER tuning — adjust these without touching logic
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Distance from the TA goal at which HEADHUNTER starts watching YOLO (metres).
+# If the sign is visible while the car is within this bubble, skip straight to
+# PARKING.  Increase if the sign isn't in frame early enough; decrease if you
+# get false triggers far from the goal.
+HEADHUNTER_RADIUS = 1.0   # metres — tune here
+
+# Number of consecutive 10 Hz state-machine ticks with a valid parking-meter
+# ROI before HEADHUNTER commits.  At 10 Hz, 3 ticks = ~300 ms debounce.
+# Increase to reduce false positives; decrease to react faster.
+HEADHUNTER_DEBOUNCE_TICKS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -74,16 +108,12 @@ class FinalChallengeStateMachine(Node):
         #  Parameters                                                          #
         # ------------------------------------------------------------------ #
         self.declare_parameter("odom_topic",             "/pf/pose/odom")
-        # /vesc/high_level/input/nav_0 is the safety_controller's nav input;
-        # publishing here lets it interpose on this node's _stop() and
-        # recovery-reverse commands. /vesc/ackermann_cmd is the mux's final
-        # output and bypasses every layer above the VESC — never default to it.
         self.declare_parameter("drive_topic",            "/vesc/high_level/input/nav_0")
         self.declare_parameter("arrival_threshold",      0.75)  # metres
         self.declare_parameter("park_duration",          5.0)   # seconds
         self.declare_parameter("return_to_start",        True)
-        self.declare_parameter("planning_wait_secs",     1.0)   # wait after sending goal
-        self.declare_parameter("recovery_duration",      1.5)   # seconds to reverse after each stop
+        self.declare_parameter("planning_wait_secs",     1.0)
+        self.declare_parameter("recovery_duration",      1.5)   # seconds to reverse
 
         self.odom_topic        = self.get_parameter("odom_topic").value
         self.drive_topic       = self.get_parameter("drive_topic").value
@@ -97,25 +127,28 @@ class FinalChallengeStateMachine(Node):
         #  Internal state                                                      #
         # ------------------------------------------------------------------ #
         self.state              = State.IDLE
-        self.goal_locations     = []    # list of (x, y) from basement_point_publisher
+        self.goal_locations     = []
         self.current_goal_idx   = 0
-        self.current_pose       = None  # (x, y, yaw) — updated continuously from odom
-        self.start_pose         = None  # saved once on first odom message
+        self.current_pose       = None   # (x, y, yaw)
+        self.start_pose         = None
         self.park_start_time    = None
-        self.recover_start_time = None  # time RECOVERING state was entered
-        self.plan_sent_time     = None  # time goal was sent to planner
+        self.recover_start_time = None
+        self.plan_sent_time     = None
 
-        # Signals set by teammate callbacks (None/False until integrated)
-        self.detected_sign      = None  # str e.g. "parking meter" — set by [WEIMING]
-        self.parking_done       = False # set by [KEVIN]
+        # Teammate signals
+        self.detected_sign  = None   # str e.g. "parking meter" — set by [WEIMING]
+        self.parking_done   = False  # set by [KEVIN]
+
+        # HEADHUNTER state
+        self.headhunter_roi        = None   # latest RegionOfInterest from YOLO
+        self.headhunter_hit_count  = 0      # consecutive ticks with valid ROI
+
+        # DETECTING_SIGN timeout
+        self._detect_start_time = None
 
         # ------------------------------------------------------------------ #
         #  Subscriptions                                                       #
         # ------------------------------------------------------------------ #
-
-        # Goal locations from basement_point_publisher.py (our testing node) or
-        # the TA's node on race day. Uses TRANSIENT_LOCAL (latched) QoS so we
-        # receive the goals even if this node starts after the publisher already fired.
         latch_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.goals_sub = self.create_subscription(
             PoseArray,
@@ -124,8 +157,6 @@ class FinalChallengeStateMachine(Node):
             latch_qos,
         )
 
-        # Odometry / particle-filter pose — tracked continuously, no explicit
-        # "get pose" step needed before re-planning.
         self.odom_sub = self.create_subscription(
             Odometry,
             self.odom_topic,
@@ -141,11 +172,7 @@ class FinalChallengeStateMachine(Node):
             10,
         )
 
-        # ------------------------------------------------------------------
         # [KEVIN] Parking controller done signal
-        # Kevin's parking controller publishes True on /parking/done once the
-        # car has stopped within 1 m of the correct meter.
-        # ------------------------------------------------------------------
         self.parking_done_sub = self.create_subscription(
             Bool,
             "/parking/done",
@@ -153,11 +180,25 @@ class FinalChallengeStateMachine(Node):
             10,
         )
 
+        # HEADHUNTER — watch YOLO's parking-meter ROI at all times.
+        # yolo_node publishes every frame: width=0/height=0 means not detected.
+        self.headhunter_roi_sub = self.create_subscription(
+            RegionOfInterest,
+            "/yolo/parking_meter/roi",
+            self._headhunter_roi_cb,
+            10,
+        )
+        self.get_logger().info(
+            "[HEADHUNTER] Subscribed to /yolo/parking_meter/roi — "
+            f"activation radius={HEADHUNTER_RADIUS} m, "
+            f"debounce={HEADHUNTER_DEBOUNCE_TICKS} ticks"
+        )
+
         # ------------------------------------------------------------------ #
         #  Publishers                                                          #
         # ------------------------------------------------------------------ #
 
-        # Triggers the Lab 6 path planner (trajectory_planner.py)
+        # Lab 6 path planner goal
         self.goal_pub = self.create_publisher(PoseStamped, "/goal_pose", 10)
 
         # Emergency stop / direct drive command
@@ -170,18 +211,24 @@ class FinalChallengeStateMachine(Node):
             Bool, "/sign_detection/trigger", 10
         )
 
-        # ------------------------------------------------------------------
         # [KEVIN] Parking trigger
-        # Publish True to start Kevin's visual-servo parking controller.
-        # His node steers toward the YOLO bounding box centroid and stops
-        # when homography distance <= 1 m. No world-frame pose needed.
-        # ------------------------------------------------------------------
         self.parking_trigger_pub = self.create_publisher(
             Bool, "/parking/trigger", 10
         )
 
+        # Trajectory override — publishing a zero-pose PoseArray here causes
+        # trajectory_follower.py to call trajectory_callback (setting
+        # initialized_traj=True) but then pose_callback sees len(pts)<2 and
+        # returns without publishing any drive command.  This is the correct
+        # way to silence the follower while parking controller takes over.
+        # Without this, both nodes publish to /vesc/high_level/input/nav_0 and
+        # race each other — the follower wins because it runs at odom rate.
+        self.trajectory_override_pub = self.create_publisher(
+            PoseArray, "/trajectory/current", 10
+        )
+
         # ------------------------------------------------------------------ #
-        #  State machine timer — runs at 10 Hz                                #
+        #  State machine timer — 10 Hz                                        #
         # ------------------------------------------------------------------ #
         self.timer = self.create_timer(0.1, self._step)
 
@@ -192,7 +239,6 @@ class FinalChallengeStateMachine(Node):
     # ======================================================================
 
     def _goals_cb(self, msg: PoseArray):
-        """Receive the 2 target locations from basement_point_publisher."""
         if self.state != State.IDLE:
             return
         self.goal_locations = [(p.position.x, p.position.y) for p in msg.poses]
@@ -201,7 +247,6 @@ class FinalChallengeStateMachine(Node):
         )
 
     def _odom_cb(self, msg: Odometry):
-        """Track current pose from particle filter / odometry."""
         p = msg.pose.pose.position
         q = msg.pose.pose.orientation
         yaw = math.atan2(
@@ -222,7 +267,15 @@ class FinalChallengeStateMachine(Node):
 
     def _parking_done_cb(self, msg: Bool):
         if msg.data:
+            self.get_logger().info("[DEBUG] /parking/done received True — parking complete.")
             self.parking_done = True
+
+    def _headhunter_roi_cb(self, msg: RegionOfInterest):
+        """Cache the latest parking-meter ROI from yolo_node.
+        Called at camera/YOLO rate — just store, don't act.
+        Action happens in _navigating() at the state-machine tick rate.
+        """
+        self.headhunter_roi = msg
 
     # ======================================================================
     #  Helpers
@@ -234,23 +287,38 @@ class FinalChallengeStateMachine(Node):
         cmd.drive.steering_angle = 0.0
         self.drive_pub.publish(cmd)
 
+    def _kill_trajectory_follower(self):
+        """
+        Publish a zero-pose PoseArray to /trajectory/current.
+
+        trajectory_follower.trajectory_callback sets initialized_traj=True and
+        clears its points list.  On the next odom tick pose_callback sees
+        len(pts)<2 and returns without publishing anything — the follower goes
+        completely silent.  This is necessary any time we want parking_controller
+        to own the drive topic without fighting pure pursuit.
+
+        Called both from _arrived() (normal path) and _headhunter_activate()
+        so the fix applies in all cases where we stop path-following.
+        """
+        empty_traj = PoseArray()
+        empty_traj.header.frame_id = "map"
+        empty_traj.header.stamp = self.get_clock().now().to_msg()
+        self.trajectory_override_pub.publish(empty_traj)
+        self.get_logger().info(
+            "[DEBUG] Empty PoseArray published to /trajectory/current — "
+            "trajectory_follower silenced."
+        )
+
     def _start_recovery(self):
-        """Transition into RECOVERING so the robot backs up before every replan."""
         self.recover_start_time = self.get_clock().now()
         self._to(State.RECOVERING)
 
     def _dist_to(self, xy):
-        """Euclidean distance from current pose to (x, y)."""
         if self.current_pose is None:
             return float("inf")
         return math.hypot(self.current_pose[0] - xy[0], self.current_pose[1] - xy[1])
 
     def _send_goal(self, x, y, yaw=0.0):
-        """
-        Publish a PoseStamped to /goal_pose.
-        The Lab 6 trajectory_planner.py will pick this up, run A*, and publish
-        the resulting path to /trajectory/current for the follower to track.
-        """
         msg = PoseStamped()
         msg.header.frame_id = "map"
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -266,13 +334,84 @@ class FinalChallengeStateMachine(Node):
         self.get_logger().info(f"[STATE] {self.state.name} → {new_state.name}")
         self.state = new_state
 
+    def _arm_parking(self, source: str):
+        """
+        Shared activation sequence used by both normal DETECTING_SIGN path and
+        HEADHUNTER path.  Fires sign detection trigger (arms /relative_cone_px
+        feed) then fires parking trigger.
+
+        source: a short string for debug logging, e.g. "DETECTING_SIGN" or
+                "HEADHUNTER" so logs clearly show which path was taken.
+        """
+        self.get_logger().info(
+            f"[DEBUG] [{source}] Arming sign detector — "
+            "publishing /sign_detection/trigger=True"
+        )
+        self.trigger_detection_pub.publish(Bool(data=True))
+
+        self.get_logger().info(
+            f"[DEBUG] [{source}] Activating parking controller — "
+            "publishing /parking/trigger=True"
+        )
+        trigger = Bool()
+        trigger.data = True
+        self.parking_trigger_pub.publish(trigger)
+
+    def _headhunter_activate(self):
+        """
+        Called when HEADHUNTER conditions are met in _navigating().
+        Resets all flags that would normally be set by ARRIVED/DETECTING_SIGN,
+        kills the trajectory follower, arms the perception stack, and jumps
+        straight to PARKING.
+        """
+        self.get_logger().warn(
+            f"[HEADHUNTER] *** TRIGGERED *** — sign visible within "
+            f"{HEADHUNTER_RADIUS} m of goal, skipping ARRIVED+DETECTING_SIGN. "
+            f"ROI: x_offset={self.headhunter_roi.x_offset} "
+            f"y_offset={self.headhunter_roi.y_offset} "
+            f"w={self.headhunter_roi.width} h={self.headhunter_roi.height}"
+        )
+
+        # ── Reset state flags ────────────────────────────────────────────
+        # parking_done MUST be False — on goal 2 it could still be True
+        # from goal 1 and would cause an immediate fall-through to PARKED.
+        if self.parking_done:
+            self.get_logger().warn(
+                "[HEADHUNTER] parking_done was True — resetting to False. "
+                "This would have caused an instant PARKED skip."
+            )
+        self.parking_done = False
+
+        # detected_sign is normally set by _sign_cb in DETECTING_SIGN.
+        # We know it's a parking meter because YOLO told us, so set it now.
+        self.detected_sign = "parking meter"
+        self.get_logger().info(
+            "[HEADHUNTER] detected_sign set to 'parking meter' directly."
+        )
+
+        # Reset the DETECTING_SIGN timeout in case it was ever set.
+        self._detect_start_time = None
+
+        # Reset HEADHUNTER debounce counter for next goal.
+        self.headhunter_hit_count = 0
+
+        # ── Kill trajectory follower ─────────────────────────────────────
+        # Without this, pure pursuit and parking_controller both publish to
+        # /vesc/high_level/input/nav_0 at the same time and fight.
+        self._stop()
+        self._kill_trajectory_follower()
+
+        # ── Arm perception stack and parking controller ──────────────────
+        self._arm_parking("HEADHUNTER")
+
+        # ── Transition ───────────────────────────────────────────────────
+        self._to(State.PARKING)
+
     # ======================================================================
     #  Main state machine tick (10 Hz)
     # ======================================================================
 
     def _step(self):
-        # Safety controller (Diego) handles traffic law stops externally at
-        # VESC level — no interrupt logic needed here.
         {
             State.IDLE:               self._idle,
             State.PLANNING:           self._planning,
@@ -291,7 +430,6 @@ class FinalChallengeStateMachine(Node):
     # ======================================================================
 
     def _idle(self):
-        """Wait until we have received both goal locations."""
         if len(self.goal_locations) >= 2:
             self.current_goal_idx = 0
             goal = self.goal_locations[0]
@@ -299,14 +437,6 @@ class FinalChallengeStateMachine(Node):
             self._to(State.PLANNING)
 
     def _planning(self):
-        """
-        Wait a brief moment after sending the goal to give the planner time to
-        compute and publish the trajectory. The trajectory_follower will pick up
-        /trajectory/current automatically.
-
-        A more robust approach (TODO): subscribe to /trajectory/current and only
-        transition when a new message arrives after plan_sent_time.
-        """
         if self.plan_sent_time is None:
             return
         elapsed = (self.get_clock().now() - self.plan_sent_time).nanoseconds / 1e9
@@ -320,64 +450,137 @@ class FinalChallengeStateMachine(Node):
 
     def _navigating(self):
         """
-        Pure pursuit (trajectory_follower.py from Lab 6) is driving the car.
-        We just monitor distance to the goal and transition when close enough.
-        Traffic-law interrupts are handled in _step() above.
+        Pure pursuit is driving the car.  Two exit conditions:
+
+        1. Normal arrival: Euclidean distance to goal drops below
+           arrival_threshold (0.75 m).  → ARRIVED
+
+        2. HEADHUNTER: while within HEADHUNTER_RADIUS of the goal AND the
+           parking-meter ROI from yolo_node is non-zero for
+           HEADHUNTER_DEBOUNCE_TICKS consecutive ticks → skip ARRIVED and
+           DETECTING_SIGN, jump straight to PARKING.
         """
+        if self.current_pose is None:
+            return
+
         goal = self.goal_locations[self.current_goal_idx]
         dist = self._dist_to(goal)
+
         self.get_logger().info(
             f"[NAVIGATING] goal_idx={self.current_goal_idx} "
             f"goal=({goal[0]:.2f}, {goal[1]:.2f}) "
             f"pose=({self.current_pose[0]:.2f}, {self.current_pose[1]:.2f}) "
-            f"dist={dist:.3f} threshold={self.arrival_threshold}",
+            f"dist={dist:.3f} m  "
+            f"arrival_threshold={self.arrival_threshold} m  "
+            f"headhunter_radius={HEADHUNTER_RADIUS} m",
             throttle_duration_sec=1.0,
         )
+
+        # ── Normal arrival exit ──────────────────────────────────────────
         if dist < self.arrival_threshold:
             self._stop()
             self._to(State.ARRIVED)
+            return
+
+        # ── HEADHUNTER exit ──────────────────────────────────────────────
+        if dist < HEADHUNTER_RADIUS:
+            roi = self.headhunter_roi
+            roi_valid = (
+                roi is not None
+                and roi.width > 0
+                and roi.height > 0
+            )
+
+            if roi_valid:
+                self.headhunter_hit_count += 1
+                self.get_logger().info(
+                    f"[HEADHUNTER] Active — dist={dist:.3f} m < radius={HEADHUNTER_RADIUS} m, "
+                    f"ROI w={roi.width} h={roi.height}, "
+                    f"hit_count={self.headhunter_hit_count}/{HEADHUNTER_DEBOUNCE_TICKS}"
+                )
+                if self.headhunter_hit_count >= HEADHUNTER_DEBOUNCE_TICKS:
+                    self._headhunter_activate()
+            else:
+                # Inside radius but no valid ROI — reset debounce counter.
+                if self.headhunter_hit_count > 0:
+                    self.get_logger().info(
+                        f"[HEADHUNTER] Inside radius but ROI invalid/missing — "
+                        f"resetting hit_count {self.headhunter_hit_count} → 0"
+                    )
+                self.headhunter_hit_count = 0
+        else:
+            # Outside HEADHUNTER_RADIUS — ensure debounce counter is clear.
+            if self.headhunter_hit_count > 0:
+                self.headhunter_hit_count = 0
 
     def _arrived(self):
         """
-        Reached the goal zone. Reset detection state and trigger YOLO.
+        Reached the goal zone via normal distance threshold.
+        Kill the trajectory follower before handing off to parking stack.
+        Without _kill_trajectory_follower(), pure pursuit keeps publishing
+        drive commands at odom rate and fights parking_controller on the
+        same /vesc/high_level/input/nav_0 topic.
         """
+        self.get_logger().info(
+            f"[ARRIVED] Within {self.arrival_threshold} m of goal "
+            f"{self.current_goal_idx + 1}. "
+            "Silencing trajectory follower, triggering sign detection."
+        )
+        self._kill_trajectory_follower()
+
         self.detected_sign = None
+        self._detect_start_time = None
+
+        # Reset HEADHUNTER counter for this leg (may have accumulated non-zero).
+        self.headhunter_hit_count = 0
+
+        # Fire the sign detection trigger False then True to re-arm the one-shot.
         self.trigger_detection_pub.publish(Bool(data=False))
         self.trigger_detection_pub.publish(Bool(data=True))
         self.get_logger().info(
-            f"Arrived at location {self.current_goal_idx + 1}. Triggering sign detection."
+            "[DEBUG] [ARRIVED] /sign_detection/trigger pulsed False→True"
         )
         self._to(State.DETECTING_SIGN)
 
     def _detecting_sign(self):
         """
-        Wait for YOLO to identify which of the three objects is at this location.
-        self.detected_sign is set by _sign_cb() once the detector publishes a result.
+        Wait for YOLO to identify which of the three objects is a parking meter.
+        self.detected_sign is set by _sign_cb() once the detector publishes.
         """
         if self.detected_sign is None:
-        # Check timeout
-            if not hasattr(self, '_detect_start_time') or self._detect_start_time is None:
+            if self._detect_start_time is None:
                 self._detect_start_time = self.get_clock().now()
             elapsed = (self.get_clock().now() - self._detect_start_time).nanoseconds / 1e9
-            if elapsed > 10.0:  # 10-second timeout
+            if elapsed > 10.0:
                 self.get_logger().warn("Sign detection timed out — skipping location.")
                 self._detect_start_time = None
+                # Disarm sign detector before recovering.
+                self.trigger_detection_pub.publish(Bool(data=False))
+                self.get_logger().info(
+                    "[DEBUG] [DETECTING_SIGN] timeout — "
+                    "/sign_detection/trigger=False published"
+                )
                 self._start_recovery()
             return
 
-        self._detect_start_time = None  # reset for next time
-     
-        if self.detected_sign == "parking meter":
-            self.get_logger().info("Parking meter confirmed — handing off to parking controller.")
-            self.parking_done = False
+        self._detect_start_time = None
 
-            trigger = Bool()
-            trigger.data = True
-            self.parking_trigger_pub.publish(trigger)
+        if self.detected_sign == "parking meter":
+            self.get_logger().info(
+                "Parking meter confirmed — handing off to parking controller."
+            )
+            self.parking_done = False
+            self._arm_parking("DETECTING_SIGN")
             self._to(State.PARKING)
         else:
             self.get_logger().info(
-                f"Detected '{self.detected_sign}' — not a parking meter. Skipping location."
+                f"Detected '{self.detected_sign}' — not a parking meter. "
+                "Disarming sign detector and skipping location."
+            )
+            self.trigger_detection_pub.publish(Bool(data=False))
+            self.get_logger().info(
+                "[DEBUG] [DETECTING_SIGN] wrong sign — "
+                "/sign_detection/trigger=False published"
             )
             self._start_recovery()
 
@@ -397,21 +600,28 @@ class FinalChallengeStateMachine(Node):
     def _parking(self):
         """
         Wait for parking_controller.py to finish its visual-servo approach.
-        self.parking_done is set True by _parking_done_cb() when /parking/done
-        receives True from the controller.
-        Until then the state machine simply idles here at 10 Hz while the
-        parking controller owns the drive topic.
+        The parking controller owns the drive topic while we're here.
+        The trajectory follower was already silenced in _arrived() or
+        _headhunter_activate() before we got here, so there is no conflict.
         """
         if self.parking_done:
-            self.get_logger().info("Parking complete. Starting 5-second hold.")
+            self.get_logger().info(
+                "[DEBUG] [PARKING] parking_done=True received — "
+                "stopping car and entering PARKED hold."
+            )
             self._stop()
             self.park_start_time = self.get_clock().now()
             self._to(State.PARKED)
 
     def _parked(self):
         """
-        Hold stop for the required 5 seconds (spec requirement).
-        Then navigate to the next location, or return to start for bonus.
+        Hold stop for the required 5 seconds.
+        Image save happens here (not in DETECTING_SIGN) — the car is stationary
+        and close to the sign so the bounding box is large and blur-free.
+        The save is triggered by the state machine's entry into this state
+        (parking_controller publishes /parking/done → _parking() fires _stop()
+        and transitions here); sign_detector.py saves on the next valid frame
+        it receives while /sign_detection/trigger is still True.
         """
         self._stop()
         elapsed = (self.get_clock().now() - self.park_start_time).nanoseconds / 1e9
@@ -419,23 +629,26 @@ class FinalChallengeStateMachine(Node):
             return
 
         self.get_logger().info(
-            f"Held for {self.park_duration:.0f}s at location {self.current_goal_idx + 1}. "
-            "Backing out before replanning."
+            f"Held for {self.park_duration:.0f} s at location "
+            f"{self.current_goal_idx + 1}. Disarming sign detector, backing out."
+        )
+        # Disarm sign detector so it re-arms cleanly for the next location.
+        self.trigger_detection_pub.publish(Bool(data=False))
+        self.get_logger().info(
+            "[DEBUG] [PARKED] /sign_detection/trigger=False published"
         )
         self._start_recovery()
 
     def _recovering(self):
         """
-        Back slowly out of the parking spot for 1.5 s so the robot is clear of
-        the meter and back in open corridor space before replanning.  No pose
-        knowledge required — open-loop reverse gives the particle filter time to
-        reconverge on familiar geometry before the next goal is issued.
+        Back slowly out of the parking spot for recovery_duration seconds so
+        the robot is clear of the sign before replanning.
         """
         elapsed = (self.get_clock().now() - self.recover_start_time).nanoseconds / 1e9
         if elapsed < self.recovery_duration:
             cmd = AckermannDriveStamped()
-            cmd.drive.speed = -0.5          # slow reverse
-            cmd.drive.steering_angle = 0.0  # straight back
+            cmd.drive.speed = -0.5
+            cmd.drive.steering_angle = 0.0
             self.drive_pub.publish(cmd)
         else:
             self._stop()
@@ -443,21 +656,15 @@ class FinalChallengeStateMachine(Node):
             self._advance_to_next_goal()
 
     def _returning_to_start(self):
-        """
-        Optional return trip to earn +2 bonus points.
-        Diego's safety controller handles any traffic law stops on this leg too.
-        """
         if self.start_pose is None:
             self._to(State.DONE)
             return
-
         if self._dist_to((self.start_pose[0], self.start_pose[1])) < self.arrival_threshold:
             self._stop()
             self.get_logger().info("Returned to start! +2 bonus points.")
             self._to(State.DONE)
 
     def _done(self):
-        """Challenge complete. Sit still and log."""
         self._stop()
         self.get_logger().info("Challenge complete!", throttle_duration_sec=5.0)
 
