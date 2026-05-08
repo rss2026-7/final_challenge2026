@@ -291,14 +291,15 @@ class FinalChallengeStateMachine(Node):
         """
         Publish a zero-pose PoseArray to /trajectory/current.
 
-        trajectory_follower.trajectory_callback sets initialized_traj=True and
-        clears its points list.  On the next odom tick pose_callback sees
-        len(pts)<2 and returns without publishing anything — the follower goes
-        completely silent.  This is necessary any time we want parking_controller
-        to own the drive topic without fighting pure pursuit.
+        trajectory_follower.trajectory_callback detects len(poses)<2, clears
+        initialized_traj, and publishes its own zero AckermannDriveStamped so
+        the LAST command on the drive topic is an explicit stop.  Without this
+        contract, the VESC would hold whatever steering angle pure pursuit had
+        last computed at the goal and the car would swerve during handoff.
 
         Called both from _arrived() (normal path) and _headhunter_activate()
-        so the fix applies in all cases where we stop path-following.
+        so parking_controller can own the drive topic without fighting pure
+        pursuit.
         """
         empty_traj = PoseArray()
         empty_traj.header.frame_id = "map"
