@@ -182,36 +182,37 @@ class SignDetectorNode(Node):
         candidates.sort(key=lambda nc: nc[1].area, reverse=True)
         best_name, best_snap = candidates[0]
 
-        if self._latest_annotated is None:
-            # Without an annotated frame we can still publish the result,
-            # but we can't save proof to disk. That's a soft failure: log
-            # and emit the class anyway so the state machine isn't blocked.
-            self.get_logger().warn(
-                f"Detected '{best_name}' but no /yolo/annotated_image "
-                f"received yet — publishing result without saving."
-            )
-            self.result_pub.publish(String(data=best_name))
-            self.result_published = True
-            return
-
-        try:
-            annotated_bgr = self.bridge.imgmsg_to_cv2(
-                self._latest_annotated, desired_encoding="bgr8")
-        except Exception as e:
-            self.get_logger().error(f"cv_bridge failed on annotated: {e}")
-            return
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        save_path = os.path.join(
-            self.save_dir, f"{_topic_safe(best_name)}_{timestamp}.jpg")
-        cv2.imwrite(save_path, annotated_bgr)
+        # Image saving moved to parking_controller.py — the car is stationary
+        # and close to the sign when parked, giving a cleaner shot.
+        # The block below is kept for reference but disabled.
+        #
+        # if self._latest_annotated is None:
+        #     self.get_logger().warn(
+        #         f"Detected '{best_name}' but no /yolo/annotated_image "
+        #         f"received yet — publishing result without saving."
+        #     )
+        #     self.result_pub.publish(String(data=best_name))
+        #     self.result_published = True
+        #     return
+        #
+        # try:
+        #     annotated_bgr = self.bridge.imgmsg_to_cv2(
+        #         self._latest_annotated, desired_encoding="bgr8")
+        # except Exception as e:
+        #     self.get_logger().error(f"cv_bridge failed on annotated: {e}")
+        #     return
+        #
+        # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        # save_path = os.path.join(
+        #     self.save_dir, f"{_topic_safe(best_name)}_{timestamp}.jpg")
+        # cv2.imwrite(save_path, annotated_bgr)
 
         self.result_pub.publish(String(data=best_name))
         self.result_published = True
 
         self.get_logger().info(
             f"Detected '{best_name}' (bbox={best_snap.width}x{best_snap.height}"
-            f"={best_snap.area}px), saved to {save_path}"
+            f"={best_snap.area}px) — result published, image save deferred to parking_controller."
         )
 
 

@@ -29,10 +29,13 @@ import os
 import csv
 from datetime import datetime
 
+import cv2
 import rclpy
 from rclpy.node import Node
 import numpy as np
 
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
 from vs_msgs.msg import ConeLocation, ParkingError
 from ackermann_msgs.msg import AckermannDriveStamped
@@ -60,9 +63,15 @@ class ParkingController(Node):
         # the safety stack.
         self.declare_parameter("drive_topic",      "/vesc/high_level/input/nav_0")
         self.declare_parameter("parking_distance", 0.75)  # metres — target stop distance
+        self.declare_parameter(
+            "save_dir",
+            "/root/racecar_ws/src/final_challenge2026/final_challenge/sign_detections",
+        )
 
         drive_topic = self.get_parameter("drive_topic").value
         self.parking_distance = float(self.get_parameter("parking_distance").value)
+        self.save_dir = self.get_parameter("save_dir").value
+        os.makedirs(self.save_dir, exist_ok=True)
 
         # ── Internal state ────────────────────────────────────────────────
         # active: set True by /parking/trigger; controller does nothing when False
@@ -74,6 +83,12 @@ class ParkingController(Node):
         self.relative_y = 0.0
         self.prev_angle_to_cone = None
         self.prev_time_sec      = None
+
+        # Image saving — cache the latest annotated frame from yolo_node.
+        # Saved to disk the moment the jitter deadband is first satisfied
+        # (car stationary, close to sign) so the bounding box is large and blur-free.
+        self.bridge             = CvBridge()
+        self._latest_annotated  = None  # most recent sensor_msgs/Image from /yolo/annotated_image
 
         # ── Publications ──────────────────────────────────────────────────
         self.drive_pub = self.create_publisher(AckermannDriveStamped, drive_topic, 10)
@@ -87,6 +102,12 @@ class ParkingController(Node):
         # Relative cone position in car frame metres — fed by HomographyTransformer
         self.create_subscription(ConeLocation, "/relative_cone",
                                  self._relative_cone_cb, 1)
+
+        # Annotated image from yolo_node — cached and saved when parked.
+        # Uses sensor_data QoS (BEST_EFFORT, depth 1) to match yolo_node's publisher.
+        from rclpy.qos import qos_profile_sensor_data
+        self.create_subscription(Image, "/yolo/annotated_image",
+                                 self._annotated_cb, qos_profile_sensor_data)
 
         # ── CSV logging (same as visual_servoing_pkg) ─────────────────────
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -106,6 +127,10 @@ class ParkingController(Node):
     # ======================================================================
     #  State-machine integration
     # ======================================================================
+
+    def _annotated_cb(self, msg: Image):
+        """Cache the latest annotated frame from yolo_node for saving when parked."""
+        self._latest_annotated = msg
 
     def _trigger_cb(self, msg: Bool):
         """
@@ -221,7 +246,7 @@ class ParkingController(Node):
                 f"|angle|={angle_error:.3f} < {jitter_angle})"
             )
 
-            # Publish /parking/done once per activation
+            # Publish /parking/done once per activation and save proof image.
             if not self.done:
                 self.get_logger().info(
                     f"[DEBUG] Parked at {distance_to_cone:.2f} m — "
@@ -233,6 +258,31 @@ class ParkingController(Node):
                 done_msg.data = True
                 self.done_pub.publish(done_msg)
                 self.get_logger().info("[DEBUG] /parking/done published, controller now inactive.")
+
+                # ── Save annotated image ──────────────────────────────────
+                # Car is stationary and within parking_distance of the sign,
+                # so the bounding box is large and motion-blur free.
+                # Mirrors the format used previously in sign_detector.py.
+                if self._latest_annotated is not None:
+                    try:
+                        annotated_bgr = self.bridge.imgmsg_to_cv2(
+                            self._latest_annotated, desired_encoding="bgr8")
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                        save_path = os.path.join(
+                            self.save_dir, f"parking_meter_{timestamp}.jpg")
+                        cv2.imwrite(save_path, annotated_bgr)
+                        self.get_logger().info(
+                            f"[DEBUG] Parked image saved to {save_path}"
+                        )
+                    except Exception as e:
+                        self.get_logger().error(
+                            f"[DEBUG] Failed to save parked image: {e}"
+                        )
+                else:
+                    self.get_logger().warn(
+                        "[DEBUG] No annotated image available at park time — "
+                        "image not saved. Check /yolo/annotated_image is publishing."
+                    )
             else:
                 self.get_logger().info(
                     "[DEBUG] Already done — not republishing /parking/done.",
