@@ -58,7 +58,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import PoseArray, PoseStamped
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import RegionOfInterest
+from sensor_msgs.msg import LaserScan, RegionOfInterest
 from std_msgs.msg import Bool, String
 
 
@@ -78,6 +78,29 @@ HEADHUNTER_RADIUS = 1.5   # metres — tune here
 HEADHUNTER_DEBOUNCE_TICKS = 3
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  K-TURN tuning — three-point turn before RETURNING_TO_START
+# ─────────────────────────────────────────────────────────────────────────────
+# Inserted between the final RECOVERING and RETURNING_TO_START so the car can
+# flip 180° in the ~3 m hallway without asking pure pursuit to track a tight
+# U-turn arc (which the smoothed steering can't latch onto). State machine
+# drives the wheels directly during this state — trajectory_follower stays
+# silent because no /trajectory/current was published since RECOVERING.
+#
+# To DISABLE: comment out the 2-line `_begin_kturn()` hook in
+# `_advance_to_next_goal`. The flow then falls through to the original direct
+# RETURNING_TO_START transition. The K_TURN state, dispatch entry, helpers,
+# and /scan subscription are then unreachable dead code with no side effects.
+KTURN_ARC_DEG          = 60.0   # per-phase target rotation; 60-60-60 keeps body within ~0.7 m of centerline
+KTURN_SPEED            = 0.5    # m/s, magnitude (sign per phase)
+KTURN_STEER            = 0.34   # rad, same clip as pure pursuit
+KTURN_YAW_TOL_DEG      = 5.0    # phase exits when |yaw - target| < tol
+KTURN_PHASE_TIMEOUT    = 3.5    # seconds — backup exit if yaw target not reached
+KTURN_STUCK_SPEED      = 0.05   # m/s — below this magnitude counts as stuck
+KTURN_STUCK_DURATION   = 0.5    # seconds at stuck speed → advance phase early
+KTURN_FINAL_ACCEPT_DEG = 20.0   # logged-only diagnostic; phase 3 always accepts on timeout
+
+
 # ---------------------------------------------------------------------------
 #  States
 # ---------------------------------------------------------------------------
@@ -91,6 +114,7 @@ class State(Enum):
     PARKING             = auto()  # Kevin's parking controller executing maneuver
     PARKED              = auto()  # Holding 5-second stop in front of correct meter
     RECOVERING          = auto()  # Backing out of parking spot before replanning
+    K_TURN              = auto()  # Three-point turn before returning to start (see KTURN_* tunables)
     RETURNING_TO_START  = auto()  # Optional: navigating back to start for bonus pts
     DONE                = auto()  # All tasks complete
 
@@ -145,6 +169,17 @@ class FinalChallengeStateMachine(Node):
 
         # DETECTING_SIGN timeout
         self._detect_start_time = None
+
+        # K_TURN state — only used during State.K_TURN. Initialized lazily by
+        # _begin_kturn(). Tracking latest_linear_speed here (set in _odom_cb)
+        # is purely additive; nothing outside K-turn reads it.
+        self.latest_scan          = None
+        self.latest_linear_speed  = 0.0
+        self.kturn_phase          = 0
+        self.kturn_phase_start    = None
+        self.kturn_targets        = (0.0, 0.0, 0.0)
+        self.kturn_direction_sign = +1
+        self.kturn_stuck_since    = None
 
         # ------------------------------------------------------------------ #
         #  Subscriptions                                                       #
@@ -202,6 +237,15 @@ class FinalChallengeStateMachine(Node):
             "[HEADHUNTER] Subscribed to /yolo/parking_meter/roi — "
             f"activation radius={HEADHUNTER_RADIUS} m, "
             f"debounce={HEADHUNTER_DEBOUNCE_TICKS} ticks"
+        )
+
+        # K_TURN — cache latest /scan to pick turn direction at K-turn entry.
+        # Subscribed unconditionally (cheap), only read inside _pick_kturn_direction().
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            "/scan",
+            self._scan_cb,
+            10,
         )
 
         # ------------------------------------------------------------------ #
@@ -264,11 +308,17 @@ class FinalChallengeStateMachine(Node):
             1.0 - 2.0 * (q.y * q.y + q.z * q.z),
         )
         self.current_pose = (p.x, p.y, yaw)
+        # Additive: K_TURN's stuck detector reads this. No other state uses it.
+        self.latest_linear_speed = msg.twist.twist.linear.x
         if self.start_pose is None:
             self.start_pose = self.current_pose
             self.get_logger().info(
                 f"Start pose saved: ({p.x:.2f}, {p.y:.2f}, yaw={math.degrees(yaw):.1f} deg)"
             )
+
+    def _scan_cb(self, msg: LaserScan):
+        """Cache latest /scan. Read only by _pick_kturn_direction()."""
+        self.latest_scan = msg
 
     # [WEIMING]
     def _sign_cb(self, msg: String):
@@ -453,6 +503,7 @@ class FinalChallengeStateMachine(Node):
             State.PARKING:            self._parking,
             State.PARKED:             self._parked,
             State.RECOVERING:         self._recovering,
+            State.K_TURN:             self._kturn,
             State.RETURNING_TO_START: self._returning_to_start,
             State.DONE:               self._done,
         }[self.state]()
@@ -631,6 +682,10 @@ class FinalChallengeStateMachine(Node):
             self._to(State.PLANNING)
         elif self.return_to_start and self.start_pose is not None:
             self.get_logger().info("All locations visited. Returning to start for +2 bonus.")
+            # ─── K-TURN HOOK (comment out next 2 lines to disable K-turn) ───
+            if self._begin_kturn():
+                return
+            # ────────────────────────────────────────────────────────────────
             self._send_goal(self.start_pose[0], self.start_pose[1])
             self._to(State.RETURNING_TO_START)
         else:
@@ -698,6 +753,185 @@ class FinalChallengeStateMachine(Node):
             self._stop()
             self.get_logger().info("Recovery complete — resuming navigation.")
             self._advance_to_next_goal()
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  K_TURN — three-point turn before RETURNING_TO_START
+    #  Self-contained block. Comment out the `_begin_kturn()` call inside
+    #  `_advance_to_next_goal` to disable; everything below becomes dead code
+    #  with no behavioral effect on the rest of the state machine.
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _wrap_angle(diff: float) -> float:
+        """Wrap an angular difference to (-pi, pi]."""
+        return math.atan2(math.sin(diff), math.cos(diff))
+
+    def _pick_kturn_direction(self) -> int:
+        """
+        Return +1 (CCW / first arc to the LEFT) or -1 (CW / first arc to the
+        RIGHT). The first phase pushes the rear axle toward the chosen side,
+        so we point that arc at the FAR wall (more clearance for body sweep).
+
+        Falls back to +1 if no scan has been cached yet.
+        """
+        scan = self.latest_scan
+        if scan is None or len(scan.ranges) == 0:
+            self.get_logger().warn(
+                "[K_TURN] No /scan cached at entry — defaulting to CCW (left first)."
+            )
+            return +1
+
+        # Sample at ±90° from the laser frame's forward axis (matches body
+        # forward on this car). Clamp indices in case the scan FoV doesn't
+        # quite reach ±90°.
+        n = len(scan.ranges)
+        idx_left  = int(round(( math.pi / 2.0 - scan.angle_min) / scan.angle_increment))
+        idx_right = int(round((-math.pi / 2.0 - scan.angle_min) / scan.angle_increment))
+        idx_left  = max(0, min(n - 1, idx_left))
+        idx_right = max(0, min(n - 1, idx_right))
+
+        left_d  = scan.ranges[idx_left]
+        right_d = scan.ranges[idx_right]
+        if not math.isfinite(left_d):  left_d  = 0.0
+        if not math.isfinite(right_d): right_d = 0.0
+
+        sign = +1 if left_d >= right_d else -1
+        self.get_logger().info(
+            f"[K_TURN] Scan-based direction: left_d={left_d:.2f} m  right_d={right_d:.2f} m "
+            f"→ {'CCW(left first)' if sign > 0 else 'CW(right first)'}"
+        )
+        return sign
+
+    def _begin_kturn(self) -> bool:
+        """
+        Initialize K-turn state and transition to State.K_TURN.
+
+        Returns True on success (caller should `return` immediately so the
+        original RETURNING_TO_START transition is bypassed). Returns False
+        if pose isn't available yet — caller falls through to the original
+        flow and behavior matches the pre-K-turn code.
+        """
+        if self.current_pose is None:
+            self.get_logger().warn("[K_TURN] No current_pose at entry — skipping K-turn.")
+            return False
+
+        start_yaw = self.current_pose[2]
+        sign = self._pick_kturn_direction()
+        arc = math.radians(KTURN_ARC_DEG)
+
+        self.kturn_direction_sign = sign
+        self.kturn_targets = (
+            start_yaw + sign * arc,
+            start_yaw + sign * 2.0 * arc,
+            start_yaw + sign * 3.0 * arc,
+        )
+        self.kturn_phase = 1
+        self.kturn_phase_start = self.get_clock().now()
+        self.kturn_stuck_since = None
+
+        self.get_logger().info(
+            f"[K_TURN] Beginning. start_yaw={math.degrees(start_yaw):+.1f}°  "
+            f"targets=({math.degrees(self.kturn_targets[0]):+.1f}°, "
+            f"{math.degrees(self.kturn_targets[1]):+.1f}°, "
+            f"{math.degrees(self.kturn_targets[2]):+.1f}°)"
+        )
+        self._to(State.K_TURN)
+        return True
+
+    def _kturn_advance_phase(self):
+        """Bump phase counter, or finalize and transition to RETURNING_TO_START."""
+        if self.kturn_phase < 3:
+            self.kturn_phase += 1
+            self.kturn_phase_start = self.get_clock().now()
+            self.kturn_stuck_since = None
+            self.get_logger().info(f"[K_TURN] → phase {self.kturn_phase}")
+            return
+
+        # Phase 3 exit: finalize.
+        yaw_now = self.current_pose[2] if self.current_pose else 0.0
+        final_err = self._wrap_angle(yaw_now - self.kturn_targets[2])
+        accept_tol = math.radians(KTURN_FINAL_ACCEPT_DEG)
+        verdict = "within" if abs(final_err) < accept_tol else "OUTSIDE"
+        self.get_logger().info(
+            f"[K_TURN] Complete. final_yaw_err={math.degrees(final_err):+.1f}° "
+            f"({verdict} ±{KTURN_FINAL_ACCEPT_DEG:.0f}° accept). "
+            "Sending start_pose to planner."
+        )
+        self._stop()
+        self._send_goal(self.start_pose[0], self.start_pose[1])
+        self._to(State.RETURNING_TO_START)
+
+    def _kturn(self):
+        """
+        Per-tick handler at 10 Hz. Publishes raw drive commands to the nav
+        topic — pure pursuit is silent here because no /trajectory/current
+        was emitted between the last RECOVERING and now.
+        """
+        if self.current_pose is None:
+            return
+
+        sign = self.kturn_direction_sign
+        target = self.kturn_targets[self.kturn_phase - 1]
+        yaw_err = self._wrap_angle(self.current_pose[2] - target)
+        elapsed = (self.get_clock().now() - self.kturn_phase_start).nanoseconds / 1e9
+
+        # 1) Yaw target reached → advance.
+        if abs(yaw_err) < math.radians(KTURN_YAW_TOL_DEG):
+            self.get_logger().info(
+                f"[K_TURN] Phase {self.kturn_phase} hit yaw target "
+                f"(err={math.degrees(yaw_err):+.1f}°, t={elapsed:.2f}s)"
+            )
+            self._kturn_advance_phase()
+            return
+
+        # 2) Stuck detection → advance early. Catches safety_controller brakes
+        #    and wall contact so we don't burn the full timeout idling.
+        if abs(self.latest_linear_speed) < KTURN_STUCK_SPEED:
+            if self.kturn_stuck_since is None:
+                self.kturn_stuck_since = self.get_clock().now()
+            else:
+                stuck_for = (self.get_clock().now() - self.kturn_stuck_since).nanoseconds / 1e9
+                if stuck_for > KTURN_STUCK_DURATION:
+                    self.get_logger().warn(
+                        f"[K_TURN] Phase {self.kturn_phase} stuck "
+                        f"(|v|<{KTURN_STUCK_SPEED} for {stuck_for:.2f}s) — advancing."
+                    )
+                    self._kturn_advance_phase()
+                    return
+        else:
+            self.kturn_stuck_since = None
+
+        # 3) Phase timeout → advance.
+        if elapsed > KTURN_PHASE_TIMEOUT:
+            self.get_logger().warn(
+                f"[K_TURN] Phase {self.kturn_phase} timeout after "
+                f"{elapsed:.2f}s (err={math.degrees(yaw_err):+.1f}°) — advancing."
+            )
+            self._kturn_advance_phase()
+            return
+
+        # Otherwise: publish phase command. Phase 2 reverses direction and
+        # flips steering sign so the ICR stays on the same side of the body
+        # — rotation continues in the same world-frame direction.
+        cmd = AckermannDriveStamped()
+        if self.kturn_phase == 1:
+            cmd.drive.speed          = +KTURN_SPEED
+            cmd.drive.steering_angle = +KTURN_STEER * sign
+        elif self.kturn_phase == 2:
+            cmd.drive.speed          = -KTURN_SPEED
+            cmd.drive.steering_angle = -KTURN_STEER * sign
+        else:  # phase 3
+            cmd.drive.speed          = +KTURN_SPEED
+            cmd.drive.steering_angle = +KTURN_STEER * sign
+        self.drive_pub.publish(cmd)
+
+        self.get_logger().info(
+            f"[K_TURN] phase={self.kturn_phase} sign={sign:+d}  "
+            f"speed={cmd.drive.speed:+.2f}  "
+            f"steer={math.degrees(cmd.drive.steering_angle):+.1f}°  "
+            f"yaw_err={math.degrees(yaw_err):+.1f}°  t={elapsed:.2f}s",
+            throttle_duration_sec=0.5,
+        )
 
     def _returning_to_start(self):
         if self.start_pose is None:
