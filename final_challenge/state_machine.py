@@ -70,7 +70,7 @@ from std_msgs.msg import Bool, String
 # If the sign is visible while the car is within this bubble, skip straight to
 # PARKING.  Increase if the sign isn't in frame early enough; decrease if you
 # get false triggers far from the goal.
-HEADHUNTER_RADIUS = 2.0   # metres — tune here
+HEADHUNTER_RADIUS = 1.5   # metres — tune here
 
 # Number of consecutive 10 Hz state-machine ticks with a valid parking-meter
 # ROI before HEADHUNTER commits.  At 10 Hz, 3 ticks = ~300 ms debounce.
@@ -109,11 +109,11 @@ class FinalChallengeStateMachine(Node):
         # ------------------------------------------------------------------ #
         self.declare_parameter("odom_topic",             "/pf/pose/odom")
         self.declare_parameter("drive_topic",            "/vesc/high_level/input/nav_0")
-        self.declare_parameter("arrival_threshold",      .1)  # metres
+        self.declare_parameter("arrival_threshold",      .2)  # metres
         self.declare_parameter("park_duration",          5.0)   # seconds
         self.declare_parameter("return_to_start",        True)
         self.declare_parameter("planning_wait_secs",     1.0)
-        self.declare_parameter("recovery_duration",      3.0)   # seconds to reverse
+        self.declare_parameter("recovery_duration",      6.0)   # seconds to reverse
 
         self.odom_topic        = self.get_parameter("odom_topic").value
         self.drive_topic       = self.get_parameter("drive_topic").value
