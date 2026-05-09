@@ -70,7 +70,7 @@ from std_msgs.msg import Bool, String
 # If the sign is visible while the car is within this bubble, skip straight to
 # PARKING.  Increase if the sign isn't in frame early enough; decrease if you
 # get false triggers far from the goal.
-HEADHUNTER_RADIUS = 1.0   # metres — tune here
+HEADHUNTER_RADIUS = 2.0   # metres — tune here
 
 # Number of consecutive 10 Hz state-machine ticks with a valid parking-meter
 # ROI before HEADHUNTER commits.  At 10 Hz, 3 ticks = ~300 ms debounce.
@@ -109,11 +109,11 @@ class FinalChallengeStateMachine(Node):
         # ------------------------------------------------------------------ #
         self.declare_parameter("odom_topic",             "/pf/pose/odom")
         self.declare_parameter("drive_topic",            "/vesc/high_level/input/nav_0")
-        self.declare_parameter("arrival_threshold",      0.75)  # metres
+        self.declare_parameter("arrival_threshold",      .1)  # metres
         self.declare_parameter("park_duration",          5.0)   # seconds
         self.declare_parameter("return_to_start",        True)
         self.declare_parameter("planning_wait_secs",     1.0)
-        self.declare_parameter("recovery_duration",      1.5)   # seconds to reverse
+        self.declare_parameter("recovery_duration",      3.0)   # seconds to reverse
 
         self.odom_topic        = self.get_parameter("odom_topic").value
         self.drive_topic       = self.get_parameter("drive_topic").value
@@ -161,6 +161,16 @@ class FinalChallengeStateMachine(Node):
             Odometry,
             self.odom_topic,
             self._odom_cb,
+            10,
+        )
+
+        # Watch what pure pursuit is publishing on the drive topic so we can
+        # see the steering/speed it commands while NAVIGATING. Logged only in
+        # that state to keep the rest of the run quiet.
+        self.drive_monitor_sub = self.create_subscription(
+            AckermannDriveStamped,
+            self.drive_topic,
+            self._drive_monitor_cb,
             10,
         )
 
@@ -270,6 +280,22 @@ class FinalChallengeStateMachine(Node):
             self.get_logger().info("[DEBUG] /parking/done received True — parking complete.")
             self.parking_done = True
 
+    def _drive_monitor_cb(self, msg: AckermannDriveStamped):
+        """Log drive commands hitting the nav drive topic — but only while
+        NAVIGATING, since pure pursuit owns the topic in that state. Outside
+        NAVIGATING, this topic is also written by state_machine itself
+        (_stop, _recovering) and parking_controller, so logging there would
+        just be noise.
+        """
+        if self.state != State.NAVIGATING:
+            return
+        self.get_logger().info(
+            f"[NAVIGATING][PP→drive] speed={msg.drive.speed:+.2f} m/s  "
+            f"steer={math.degrees(msg.drive.steering_angle):+.1f} deg "
+            f"({msg.drive.steering_angle:+.3f} rad)",
+            throttle_duration_sec=0.5,
+        )
+
     def _headhunter_roi_cb(self, msg: RegionOfInterest):
         """Cache the latest parking-meter ROI from yolo_node.
         Called at camera/YOLO rate — just store, don't act.
@@ -285,6 +311,11 @@ class FinalChallengeStateMachine(Node):
         cmd = AckermannDriveStamped()
         cmd.drive.speed = 0.0
         cmd.drive.steering_angle = 0.0
+        # Active brake — VESC honors negative acceleration as a deceleration
+        # target. Without this, speed=0 is interpreted as "duty cycle 0 /
+        # coast" and the car drifts on momentum. Matches safety_controller's
+        # brake_accel (8.0 m/s²).
+        cmd.drive.acceleration = -8.0
         self.drive_pub.publish(cmd)
 
     def _kill_trajectory_follower(self):
@@ -522,6 +553,13 @@ class FinalChallengeStateMachine(Node):
         drive commands at odom rate and fights parking_controller on the
         same /vesc/high_level/input/nav_0 topic.
         """
+        # Flood a zero on the drive topic before we touch the follower. The
+        # NAVIGATING→ARRIVED transition publishes one stop ~100 ms ago, but
+        # pure pursuit's pose_callback (50 Hz) keeps firing forward+steer
+        # commands until trajectory_callback processes the empty PoseArray.
+        # That window is what produces the "swerve at the goal" — adding this
+        # second zero now narrows it.
+        self._stop()
         self.get_logger().info(
             f"[ARRIVED] Within {self.arrival_threshold} m of goal "
             f"{self.current_goal_idx + 1}. "
@@ -648,9 +686,14 @@ class FinalChallengeStateMachine(Node):
         elapsed = (self.get_clock().now() - self.recover_start_time).nanoseconds / 1e9
         if elapsed < self.recovery_duration:
             cmd = AckermannDriveStamped()
-            cmd.drive.speed = -0.5
+            cmd.drive.speed = -1.0
             cmd.drive.steering_angle = 0.0
             self.drive_pub.publish(cmd)
+            self.get_logger().info(
+                f"[RECOVERING] elapsed={elapsed:.2f}/{self.recovery_duration:.1f}s "
+                f"publishing speed={cmd.drive.speed:+.2f} steer={cmd.drive.steering_angle:+.2f}",
+                throttle_duration_sec=0.3,
+            )
         else:
             self._stop()
             self.get_logger().info("Recovery complete — resuming navigation.")

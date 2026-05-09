@@ -214,7 +214,11 @@ class ParkingController(Node):
             dt     = max(now_sec - self.prev_time_sec, 1e-3)
             derror = (angle_to_cone - self.prev_angle_to_cone) / dt
 
-        k_p_steer = 1.0
+        # k_p=1.0 (radians/radian) saturates the steering to ±0.34 for any
+        # angle >19.5° off-axis, producing a hard "full-lock" lurch on the
+        # first control tick when the meter is well to the side. 0.5 keeps
+        # response gentle until ~39° before saturating.
+        k_p_steer = 0.5
         k_d_steer = 0.1
         steering_cmd   = k_p_steer * angle_to_cone - k_d_steer * derror
         steering_angle = float(np.clip(steering_cmd, -0.34, 0.34))
@@ -232,7 +236,7 @@ class ParkingController(Node):
         # ── Jitter deadband ───────────────────────────────────────────────
         # Only declare done when BOTH close enough AND facing the meter.
         # This prevents stopping while still pointing sideways.
-        jitter_distance = 0.1   # metres
+        jitter_distance = 0.3   # metres
         jitter_angle    = 0.05  # radians (~3°)
         angle_error     = abs(angle_to_cone)
 
@@ -290,23 +294,28 @@ class ParkingController(Node):
                 )
 
         elif distance_error > 0:
-            # Too far — drive forward, proportional speed
-            speed = float(np.clip(0.5 * distance_error, 0.2, 1.0))
+            # Too far — drive forward, proportional speed scaled by angle.
+            # cos(angle) gives full speed straight ahead, 0.5× at 60°, 0 at
+            # 90°. Floor at 0.15 so we keep some progress rather than freezing
+            # when the meter is hard to the side.
+            angle_speed_factor = float(max(np.cos(angle_to_cone), 0.15))
+            speed = float(np.clip(0.5 * distance_error, 0.2, 1.0)) * angle_speed_factor
             drive_cmd.drive.speed          = speed
             drive_cmd.drive.steering_angle = steering_angle
             self.get_logger().info(
                 f"[DEBUG] DECISION=FORWARD — speed={speed:.3f} steer={steering_angle:+.3f} "
-                f"(dist_err=+{distance_error:.3f})",
+                f"(dist_err=+{distance_error:.3f}, angle_factor={angle_speed_factor:.2f})",
                 throttle_duration_sec=0.25,
             )
         else:
-            # Overshot — reverse slowly
-            speed = float(np.clip(0.5 * distance_error, -1.0, -0.2))
+            # Overshot — reverse slowly, scaled by angle factor as well.
+            angle_speed_factor = float(max(np.cos(angle_to_cone), 0.15))
+            speed = float(np.clip(0.5 * distance_error, -1.0, -0.2)) * angle_speed_factor
             drive_cmd.drive.speed          = speed
             drive_cmd.drive.steering_angle = -steering_angle
             self.get_logger().info(
                 f"[DEBUG] DECISION=REVERSE — speed={speed:.3f} steer={-steering_angle:+.3f} "
-                f"(overshot, dist_err={distance_error:.3f})",
+                f"(overshot, dist_err={distance_error:.3f}, angle_factor={angle_speed_factor:.2f})",
                 throttle_duration_sec=0.25,
             )
 
