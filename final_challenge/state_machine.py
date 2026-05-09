@@ -645,7 +645,7 @@ class FinalChallengeStateMachine(Node):
             if self._detect_start_time is None:
                 self._detect_start_time = self.get_clock().now()
             elapsed = (self.get_clock().now() - self._detect_start_time).nanoseconds / 1e9
-            if elapsed > 10.0:
+            if elapsed > 30.0:
                 self.get_logger().warn("Sign detection timed out — skipping location.")
                 self._detect_start_time = None
                 # Disarm sign detector before recovering.
