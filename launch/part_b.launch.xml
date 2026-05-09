@@ -17,9 +17,9 @@
        description="Set true when running in the simulator (overrides odom/drive topics)"/>
 
 
-  <!-- Camera -->
-  <!-- ZED: ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zed -->
-  <include file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py">
+  <!-- Camera (real robot only — ZED is not available in sim) -->
+  <include file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py"
+           unless="$(var sim)">
     <arg name="camera_model" value="zed"/>
   </include>
 
@@ -41,7 +41,8 @@
 
   <!-- ── Central YOLO inference (every other perception node listens
        to its outputs; running it twice would race the bbox vs frame). ── -->
-  <node pkg="final_challenge" exec="yolo_node" output="screen">
+  <node pkg="final_challenge" exec="yolo_node" output="screen"
+        unless="$(var sim)">
     <param name="model" value="/home/racecar/racecar_ws/yolo11n.pt"/>
   </node>
 

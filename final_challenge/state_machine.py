@@ -51,6 +51,8 @@ normal ARRIVED transition do this.
 import math
 import rclpy
 
+from path_planning.utils import LineTrajectory
+
 from enum import Enum, auto
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
@@ -138,6 +140,7 @@ class FinalChallengeStateMachine(Node):
         self.declare_parameter("return_to_start",        True)
         self.declare_parameter("planning_wait_secs",     1.0)
         self.declare_parameter("recovery_duration",      6.0)   # seconds to reverse
+        self.declare_parameter("return_trajectory",       "")
 
         self.odom_topic        = self.get_parameter("odom_topic").value
         self.drive_topic       = self.get_parameter("drive_topic").value
@@ -145,7 +148,8 @@ class FinalChallengeStateMachine(Node):
         self.park_duration     = self.get_parameter("park_duration").value
         self.return_to_start   = self.get_parameter("return_to_start").value
         self.planning_wait     = self.get_parameter("planning_wait_secs").value
-        self.recovery_duration = self.get_parameter("recovery_duration").value
+        self.recovery_duration         = self.get_parameter("recovery_duration").value
+        self.return_trajectory_path    = self.get_parameter("return_trajectory").value
 
         # ------------------------------------------------------------------ #
         #  Internal state                                                      #
@@ -682,11 +686,14 @@ class FinalChallengeStateMachine(Node):
             self._to(State.PLANNING)
         elif self.return_to_start and self.start_pose is not None:
             self.get_logger().info("All locations visited. Returning to start for +2 bonus.")
-            # ─── K-TURN HOOK (comment out next 2 lines to disable K-turn) ───
-            if self._begin_kturn():
-                return
+            # ─── K-TURN HOOK (disabled — using pre-built loop trajectory) ───
+            # if self._begin_kturn():
+            #     return
             # ────────────────────────────────────────────────────────────────
-            self._send_goal(self.start_pose[0], self.start_pose[1])
+            traj = LineTrajectory(self, None)
+            traj.load(self.return_trajectory_path)
+            self.trajectory_override_pub.publish(traj.toPoseArray())
+            self.get_logger().info(f"Published return trajectory from {self.return_trajectory_path}")
             self._to(State.RETURNING_TO_START)
         else:
             self._to(State.DONE)
